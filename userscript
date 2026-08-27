@@ -84,7 +84,7 @@
     };
 
     // =========================================================================
-    // 3. RIGHT-CLICK CONTEXT MENU (Option A)
+    // 3. RIGHT-CLICK CONTEXT MENU
     // =========================================================================
     
     let currentContextMenu = null;
@@ -674,7 +674,7 @@
     // 11. GOOGLE DRIVE SYNC ENGINE
     // =========================================================================
 
-    const GOOGLE_CLIENT_ID = '269776090516-op99s4a10dd03qje3dicatb84n4ia272.apps.googleusercontent.com';
+    const GOOGLE_CLIENT_ID = 'INSERTYOURCLIENTIDHERE.apps.googleusercontent.com';
     const FILE_NAME = 'sniffies_soft_filter_backup.json';
     
     let driveAccessToken = GM_getValue('snp_drive_token', null);
@@ -823,10 +823,18 @@
     // INITIALIZATION & BOOTSTRAP
     // =========================================================================
 
+    // The Watchdog: Checks if React deleted our UI, and puts it back if missing.
+    const maintainUI = () => {
+        if (!document.getElementById('snp-dashboard-launcher')) {
+            injectDashboardUI();
+            setTimeout(addSyncTab, 500); // Ensure the sync tab gets re-added too
+        }
+    };
+
     const init = () => {
         injectStyles();
-        setTimeout(injectDashboardUI, 1000);
-        setTimeout(addSyncTab, 1500);
+        // Start the watchdog to run every 2 seconds forever
+        setInterval(maintainUI, 2000);
         console.log("[SniffiesFilter] Modernized V2 Loaded.");
     };
 
@@ -841,10 +849,8 @@
         const token = params.get('access_token');
         if (token) {
             GM_setValue('snp_drive_token', token);
-            window.location.hash = ''; 
+            window.location.hash = '';
             alert("Sniffies Soft Filter: Google Drive Token captured successfully! You can close this tab if it popped up.");
         }
     }
-
-// CRITICAL FIX: The closing wrapper is now at the very end of the file.
 })();
