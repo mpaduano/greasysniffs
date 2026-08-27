@@ -1,0 +1,517 @@
+    const closePhraseMenu = () => {
+        if (currentPhraseMenu) {
+            currentPhraseMenu.remove();
+            currentPhraseMenu = null;
+        }
+    };
+    // This function mimics sending a chat message by injecting text into the Sniffies chat box
+    const sendChatMessage = (phrase) => {
+        const chatInput = document.querySelector('textarea[placeholder*="message" i], input[placeholder*="message" i]');
+        const sendBtn = document.querySelector('button[aria-label="Send"], button[title="Send"]'); // Sniffies specific selectors
+        
+        if (chatInput) {
+            // React inputs require native value setter to trigger changes
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set 
+                || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            
+            nativeInputValueSetter.call(chatInput, phrase);
+            chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+            
+            if (sendBtn) {
+                setTimeout(() => sendBtn.click(), 100);
+            }
+        } else {
+            console.warn("[SniffiesFilter] Chat input not found. Make sure a chat window is open.");
+        }
+    };
+    // Triggered by the Context Menu created in Phase 1
+    const showQuickPhraseMenu = (x, y, profileId) => {
+        closePhraseMenu();
+        const menu = document.createElement('div');
+        menu.id = 'snp-phrase-menu';
+        menu.style.cssText = `
+            position: fixed; z-index: 1000001; 
+            background: rgba(12, 18, 30, 0.98);
+            border: 1px solid rgba(255,255,255,0.2); border-radius: 8px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6); padding: 8px;
+            display: flex; flex-direction: column; gap: 6px; min-width: 200px;
+            left: ${Math.min(x, window.innerWidth - 220)}px;
+            top: ${Math.min(y, window.innerHeight - 300)}px;
+        `;
+        const title = document.createElement('div');
+        title.textContent = '💬 Quick Phrases';
+        title.style.cssText = 'font-size: 11px; color: #8ea0ba; margin-bottom: 4px; font-weight: bold;';
+        menu.appendChild(title);
+        // Populate phrases from state
+        const phrases = appState.introMessages.split('\n').map(p => p.trim()).filter(p => p.length > 0);
+        
+        phrases.forEach(phrase => {
+            const btn = document.createElement('button');
+            btn.className = 'snp-context-btn';
+            btn.textContent = phrase;
+            btn.onclick = () => {
+                sendChatMessage(phrase);
+                closePhraseMenu();
+            };
+            menu.appendChild(btn);
+        });
+        document.body.appendChild(menu);
+        currentPhraseMenu = menu;
+    };
+    // Connect this to Phase 1's Context Menu!
+    // (If you look at the Phase 1 code, replace the 'TODO: Trigger Quick Phrase' line with this:)
+    // showQuickPhraseMenu(x, y, profileId);
+    // =========================================================================
+    // 9. PROFILE VIEW INJECTOR (Notes & Bookmarks)
+    // =========================================================================
+    
+    // Sniffies renders profiles in a modal. We need to observe the DOM for it.
+    const observeProfileModals = () => {
+        const observer = new MutationObserver((mutations) => {
+            for (let mutation of mutations) {
+                if (mutation.addedNodes.length) {
+                    // Sniffies usually wraps the open profile in a specific modal container
+                    const profileModal = document.querySelector('[data-testid="profileModal"], .profile-modal-container');
+                    
+                    // Prevent duplicate injections
+                    if (profileModal && !document.getElementById('snp-crm-container')) {
+                        injectProfileCRM(profileModal);
+                    }
+                }
+            }
+        });
+        
+        observer.observe(document.body, { childList: true, subtree: true });
+    };
+    const injectProfileCRM = (modalNode) => {
+        // Extract the user ID from the profile modal URL or DOM 
+        const match = window.location.pathname.match(/\/profile\/([a-zA-Z0-9_-]+)/);
+        if (!match) return;
+        const profileId = match[1];
+        // Create the CRM UI Container
+        const crmContainer = document.createElement('div');
+        crmContainer.id = 'snp-crm-container';
+        crmContainer.style.cssText = `
+            background: rgba(100, 150, 255, 0.1); border-left: 3px solid rgba(100, 150, 255, 0.6);
+            padding: 10px; margin: 12px 16px; border-radius: 6px;
+            display: flex; flex-direction: column; gap: 8px;
+        `;
+        // 1. Bookmark Toggle
+        const isBookmarked = !!bookmarkedProfiles[profileId];
+        const bookmarkBtn = document.createElement('button');
+        bookmarkBtn.textContent = isBookmarked ? '⭐ Bookmarked' : '☆ Bookmark Profile';
+        bookmarkBtn.style.cssText = `
+            align-self: flex-start; padding: 4px 10px; border-radius: 4px; border: none; cursor: pointer;
+            background: ${isBookmarked ? 'rgba(255,210,80,0.3)' : 'rgba(255,255,255,0.1)'};
+            color: ${isBookmarked ? '#ffd250' : '#fff'}; font-weight: bold;
+        `;
+        
+        bookmarkBtn.onclick = () => {
+            if (bookmarkedProfiles[profileId]) {
+                delete bookmarkedProfiles[profileId];
+                bookmarkBtn.textContent = '☆ Bookmark Profile';
+                bookmarkBtn.style.background = 'rgba(255,255,255,0.1)';
+                bookmarkBtn.style.color = '#fff';
+            } else {
+                bookmarkedProfiles[profileId] = { added: Date.now() };
+                bookmarkBtn.textContent = '⭐ Bookmarked';
+                bookmarkBtn.style.background = 'rgba(255,210,80,0.3)';
+                bookmarkBtn.style.color = '#ffd250';
+            }
+            saveBookmarks();
+        };
+        // 2. Personal Notes Field
+        const notesArea = document.createElement('textarea');
+        notesArea.placeholder = 'Add private notes here...';
+        notesArea.value = profileNotes[profileId] || '';
+        notesArea.style.cssText = `
+            width: 100%; min-height: 60px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2);
+            color: #fff; padding: 6px; border-radius: 4px; font-family: inherit; resize: vertical;
+        `;
+        
+        notesArea.addEventListener('input', (e) => {
+            const text = e.target.value.trim();
+            if (text) {
+                profileNotes[profileId] = text;
+            } else {
+                delete profileNotes[profileId];
+            }
+            saveNotes();
+        });
+        crmContainer.appendChild(bookmarkBtn);
+        crmContainer.appendChild(notesArea);
+        // Insert at the top of the profile content
+        const profileContentInfo = modalNode.querySelector('.profile-info, [data-testid="profileContent"]');
+        if (profileContentInfo) {
+            profileContentInfo.prepend(crmContainer);
+        } else {
+            modalNode.prepend(crmContainer);
+        }
+    };
+    // Close phrase menu on clicks
+    document.addEventListener('click', (e) => {
+        if (currentPhraseMenu && !currentPhraseMenu.contains(e.target)) {
+            closePhraseMenu();
+        }
+    });
+    // Start observing for profile modals when script loads
+    observeProfileModals();
+  
+  // =========================================================================
+    // 10. MAIN SETTINGS DASHBOARD UI
+    // =========================================================================
+    const injectDashboardUI = () => {
+        // 1. Create the Launcher Button
+        const launcher = document.createElement('button');
+        launcher.id = 'snp-dashboard-launcher';
+        launcher.textContent = '⚙️ Sniffies Filter';
+        launcher.style.cssText = `
+            position: fixed; bottom: 20px; left: 20px; z-index: 999999;
+            background: rgba(15, 20, 30, 0.95); color: #eef4ff;
+            border: 1px solid rgba(255,255,255,0.2); border-radius: 20px;
+            padding: 8px 16px; font: bold 12px system-ui, sans-serif;
+            cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            transition: background 0.2s;
+        `;
+        launcher.onmouseover = () => launcher.style.background = 'rgba(30, 42, 64, 0.95)';
+        launcher.onmouseout = () => launcher.style.background = 'rgba(15, 20, 30, 0.95)';
+        // 2. Create the Dashboard Panel (Hidden by default)
+        const dashboard = document.createElement('div');
+        dashboard.id = 'snp-main-dashboard';
+        dashboard.style.cssText = `
+            position: fixed; bottom: 60px; left: 20px; z-index: 1000000;
+            background: rgba(12, 18, 30, 0.98); color: #fff;
+            border: 1px solid rgba(255,255,255,0.2); border-radius: 12px;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.7);
+            width: 340px; max-height: 70vh; display: none; flex-direction: column;
+            font: 13px system-ui, sans-serif; overflow: hidden;
+        `;
+        // Dashboard HTML Structure
+        dashboard.innerHTML = `
+            <div style="display: flex; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05);">
+                <strong style="font-size: 14px;">Sniffies Soft Filter V2</strong>
+                <button id="snp-dash-close" style="background:none; border:none; color:#fff; cursor:pointer; font-weight:bold;">✕</button>
+            </div>
+            
+            <div style="display: flex; border-bottom: 1px solid rgba(255,255,255,0.1);">
+                <button class="snp-tab active" data-target="snp-tab-filters">Filters</button>
+                <button class="snp-tab" data-target="snp-tab-phrases">Phrases</button>
+                <button class="snp-tab" data-target="snp-tab-crm">CRM</button>
+            </div>
+            <div style="padding: 16px; overflow-y: auto; flex: 1;">
+                <!-- FILTERS TAB -->
+                <div id="snp-tab-filters" class="snp-tab-content">
+                    <label style="display:flex; gap:8px; margin-bottom: 12px; font-weight:bold; color:#67d1ff;">
+                        <input type="checkbox" id="snp-opt-enabled"> Master Enable Filter
+                    </label>
+                    <div style="margin-bottom: 12px;">
+                        <strong>Attitude Filters (Hide)</strong>
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; font-size:12px;">
+                            <label><input type="checkbox" id="snp-opt-hideBottom"> Bottom</label>
+                            <label><input type="checkbox" id="snp-opt-hideVersBottom"> Vers Bottom</label>
+                            <label><input type="checkbox" id="snp-opt-hideSide"> Side</label>
+                            <label><input type="checkbox" id="snp-opt-hideVers"> Vers</label>
+                            <label><input type="checkbox" id="snp-opt-hideVersTop"> Vers Top</label>
+                            <label><input type="checkbox" id="snp-opt-hideTop"> Top</label>
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 12px;">
+                        <strong>Chat Filters</strong>
+                        <div style="display:flex; flex-direction:column; gap: 6px; margin-top: 6px; font-size:12px;">
+                            <label><input type="checkbox" id="snp-opt-showChatAges"> Show Chat Age Badges</label>
+                            <label><input type="checkbox" id="snp-opt-hideRecentChats24h"> Hide Chatted (Last 24h)</label>
+                            <label><input type="checkbox" id="snp-opt-hideAnyChats"> Hide Chatted (Ever)</label>
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 12px;">
+                        <strong>Exclude Text (Hide if found)</strong>
+                        <textarea id="snp-opt-excludeText" style="width:100%; height:50px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:4px; margin-top:4px;" placeholder="One phrase per line..."></textarea>
+                    </div>
+                    <div>
+                        <strong>Include Text (Gold Ring if found)</strong>
+                        <textarea id="snp-opt-includeText" style="width:100%; height:50px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:4px; margin-top:4px;" placeholder="One phrase per line..."></textarea>
+                    </div>
+                </div>
+                <!-- PHRASES TAB -->
+                <div id="snp-tab-phrases" class="snp-tab-content" style="display:none;">
+                    <strong>Quick Phrases</strong>
+                    <p style="font-size:11px; color:#8ea0ba; margin: 4px 0 8px;">Enter one phrase per line. These appear in the right-click menu.</p>
+                    <textarea id="snp-opt-phrases" style="width:100%; height:200px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:4px; white-space: pre;"></textarea>
+                </div>
+                <!-- CRM TAB -->
+                <div id="snp-tab-crm" class="snp-tab-content" style="display:none;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+                        <strong>Your Bookmarks & Notes</strong>
+                        <button id="snp-refresh-crm" style="background:#ff5500; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:11px;">Refresh</button>
+                    </div>
+                    <div id="snp-crm-list" style="display:flex; flex-direction:column; gap:8px; font-size:12px; max-height: 250px; overflow-y: auto;">
+                        <!-- Injected via JS -->
+                    </div>
+                </div>
+            </div>
+        `;
+        // Inject Styles for Tabs
+        const style = document.createElement('style');
+        style.textContent = `
+            .snp-tab { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; color: #8ea0ba; padding: 10px; cursor: pointer; font-weight: bold; }
+            .snp-tab.active { color: #67d1ff; border-bottom-color: #67d1ff; background: rgba(255,255,255,0.05); }
+            .snp-tab:hover:not(.active) { color: #fff; background: rgba(255,255,255,0.02); }
+            .snp-crm-item { background: rgba(255,255,255,0.05); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); }
+            .snp-crm-item a { color: #67d1ff; text-decoration: none; font-weight: bold; }
+            .snp-crm-item a:hover { text-decoration: underline; }
+        `;
+        document.head.appendChild(style);
+        document.body.appendChild(launcher);
+        document.body.appendChild(dashboard);
+        // 3. Bind UI Logic
+        launcher.onclick = () => {
+            dashboard.style.display = dashboard.style.display === 'none' ? 'flex' : 'none';
+            if (dashboard.style.display === 'flex') renderCRMList();
+        };
+        document.getElementById('snp-dash-close').onclick = () => dashboard.style.display = 'none';
+        // Tab Switching
+        dashboard.querySelectorAll('.snp-tab').forEach(tab => {
+            tab.onclick = (e) => {
+                dashboard.querySelectorAll('.snp-tab').forEach(t => t.classList.remove('active'));
+                dashboard.querySelectorAll('.snp-tab-content').forEach(c => c.style.display = 'none');
+                e.target.classList.add('active');
+                document.getElementById(e.target.dataset.target).style.display = 'block';
+            };
+        });
+        // 4. Bind State to Inputs
+        const bindCheckbox = (id, stateKey) => {
+            const el = document.getElementById(id);
+            el.checked = appState[stateKey];
+            el.onchange = (e) => {
+                appState[stateKey] = e.target.checked;
+                saveState();
+            };
+        };
+        const bindTextarea = (id, stateKey) => {
+            const el = document.getElementById(id);
+            el.value = appState[stateKey];
+            el.addEventListener('input', (e) => {
+                appState[stateKey] = e.target.value;
+                saveState();
+            });
+        };
+        bindCheckbox('snp-opt-enabled', 'enabled');
+        bindCheckbox('snp-opt-hideBottom', 'hideBottom');
+        bindCheckbox('snp-opt-hideVersBottom', 'hideVersBottom');
+        bindCheckbox('snp-opt-hideSide', 'hideSide');
+        bindCheckbox('snp-opt-hideVers', 'hideVers');
+        bindCheckbox('snp-opt-hideVersTop', 'hideVersTop');
+        bindCheckbox('snp-opt-hideTop', 'hideTop');
+        bindCheckbox('snp-opt-showChatAges', 'showChatAges');
+        bindCheckbox('snp-opt-hideRecentChats24h', 'hideRecentChats24h');
+        bindCheckbox('snp-opt-hideAnyChats', 'hideAnyChats');
+        
+        bindTextarea('snp-opt-excludeText', 'excludeProfileTerms');
+        bindTextarea('snp-opt-includeText', 'includeProfileTerms');
+        bindTextarea('snp-opt-phrases', 'introMessages');
+        // 5. Render CRM List
+        const renderCRMList = () => {
+            const list = document.getElementById('snp-crm-list');
+            list.innerHTML = '';
+            
+            const allSavedIds = new Set([...Object.keys(bookmarkedProfiles), ...Object.keys(profileNotes)]);
+            
+            if (allSavedIds.size === 0) {
+                list.innerHTML = '<div style="color:#8ea0ba; text-align:center; padding:10px;">No bookmarks or notes yet.</div>';
+                return;
+            }
+            allSavedIds.forEach(id => {
+                const isBookmarked = !!bookmarkedProfiles[id];
+                const note = profileNotes[id] || '';
+                
+                const div = document.createElement('div');
+                div.className = 'snp-crm-item';
+                div.innerHTML = `
+                    <div style="display:flex; justify-content:space-between; margin-bottom: 4px;">
+                        <a href="/profile/${id}" target="_blank">Profile: ${id.substring(0,8)}...</a>
+                        ${isBookmarked ? '⭐' : '📝'}
+                    </div>
+                    ${note ? `<div style="color:#a9b8cc; font-style:italic;">"${note}"</div>` : ''}
+                `;
+                list.appendChild(div);
+            });
+        };
+        document.getElementById('snp-refresh-crm').onclick = renderCRMList;
+    };
+    // =========================================================================
+    // 11. GOOGLE DRIVE SYNC ENGINE
+    // =========================================================================
+    // Note: You will need to bring over your Google Cloud Client ID from the original script
+    const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID_HERE.apps.googleusercontent.com';
+    const FILE_NAME = 'sniffies_soft_filter_backup.json';
+    
+    let driveAccessToken = GM_getValue('snp_drive_token', null);
+    const getAuthHeaders = () => ({
+        'Authorization': `Bearer ${driveAccessToken}`,
+        'Content-Type': 'application/json'
+    });
+    // Generate OAuth Login URL
+    const getLoginUrl = () => {
+        const redirectUri = 'https://sniffies.com'; // Or a custom local landing page
+        const scope = 'https://www.googleapis.com/auth/drive.appdata';
+        return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=${redirectUri}&response_type=token&scope=${scope}`;
+    };
+    // 1. Find or Create Backup File
+    const getOrCreateDriveFile = async () => {
+        if (!driveAccessToken) return null;
+        try {
+            // Search for existing file
+            const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='${FILE_NAME}'`, { headers: getAuthHeaders() });
+            const searchData = await searchRes.json();
+            if (searchData.files && searchData.files.length > 0) {
+                return searchData.files[0].id;
+            }
+            // Create new file if it doesn't exist
+            const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+                method: 'POST',
+                headers: getAuthHeaders(),
+                body: JSON.stringify({ name: FILE_NAME, parents: ['appDataFolder'] })
+            });
+            const createData = await createRes.json();
+            return createData.id;
+        } catch (err) {
+            console.error("[SniffiesFilter] Drive API Error:", err);
+            return null;
+        }
+    };
+    // 2. Upload Data (Sync Up)
+    const syncToDrive = async () => {
+        document.getElementById('snp-sync-status').textContent = 'Syncing up... ⏳';
+        const fileId = await getOrCreateDriveFile();
+        if (!fileId) {
+            document.getElementById('snp-sync-status').textContent = 'Error: Not authenticated ❌';
+            return;
+        }
+        const payload = {
+            appState,
+            profileNotes,
+            bookmarkedProfiles,
+            timestamp: Date.now()
+        };
+        try {
+            await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+                method: 'PATCH',
+                headers: getAuthHeaders(),
+                body: JSON.stringify(payload)
+            });
+            document.getElementById('snp-sync-status').textContent = 'Backed up successfully! ✅';
+        } catch (err) {
+            document.getElementById('snp-sync-status').textContent = 'Upload failed ❌';
+        }
+    };
+    // 3. Download Data (Sync Down)
+    const syncFromDrive = async () => {
+        document.getElementById('snp-sync-status').textContent = 'Downloading... ⏳';
+        const fileId = await getOrCreateDriveFile();
+        if (!fileId) {
+            document.getElementById('snp-sync-status').textContent = 'Error: Not authenticated ❌';
+            return;
+        }
+        try {
+            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+                headers: getAuthHeaders()
+            });
+            
+            if (res.status === 200) {
+                const data = await res.json();
+                
+                // Merge state safely
+                appState = { ...appState, ...(data.appState || {}) };
+                profileNotes = { ...profileNotes, ...(data.profileNotes || {}) };
+                bookmarkedProfiles = { ...bookmarkedProfiles, ...(data.bookmarkedProfiles || {}) };
+                
+                saveState();
+                saveNotes();
+                saveBookmarks();
+                
+                // Force UI refresh
+                document.getElementById('snp-opt-enabled').checked = appState.enabled;
+                document.getElementById('snp-refresh-crm').click();
+                
+                document.getElementById('snp-sync-status').textContent = 'Restored successfully! ✅';
+            } else {
+                document.getElementById('snp-sync-status').textContent = 'No backup found ❌';
+            }
+        } catch (err) {
+            document.getElementById('snp-sync-status').textContent = 'Download failed ❌';
+        }
+    };
+    // =========================================================================
+    // 12. INJECT SYNC TAB INTO DASHBOARD
+    // =========================================================================
+    
+    // We append the Sync Tab logic dynamically right after the Dashboard loads
+    const addSyncTab = () => {
+        const dash = document.getElementById('snp-main-dashboard');
+        if (!dash) return;
+        // Add Tab Button
+        const tabContainer = dash.querySelector('div:nth-child(2)');
+        const syncTabBtn = document.createElement('button');
+        syncTabBtn.className = 'snp-tab';
+        syncTabBtn.dataset.target = 'snp-tab-sync';
+        syncTabBtn.textContent = 'Sync';
+        syncTabBtn.onclick = (e) => {
+            dash.querySelectorAll('.snp-tab').forEach(t => t.classList.remove('active'));
+            dash.querySelectorAll('.snp-tab-content').forEach(c => c.style.display = 'none');
+            e.target.classList.add('active');
+            document.getElementById('snp-tab-sync').style.display = 'block';
+        };
+        tabContainer.appendChild(syncTabBtn);
+        // Add Tab Content
+        const contentContainer = dash.querySelector('div:nth-child(3)');
+        const syncContent = document.createElement('div');
+        syncContent.id = 'snp-tab-sync';
+        syncContent.className = 'snp-tab-content';
+        syncContent.style.display = 'none';
+        
+        syncContent.innerHTML = `
+            <strong>Google Drive Backup</strong>
+            <p style="font-size:11px; color:#8ea0ba; margin: 4px 0 12px;">Securely sync your settings, filters, and bookmarks across devices using a hidden app folder in your Google Drive.</p>
+            
+            <div style="display:flex; flex-direction:column; gap:10px;">
+                <input type="password" id="snp-drive-token-input" placeholder="Paste OAuth Token here..." style="background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); padding:6px; border-radius:4px; font-size:11px;" value="${driveAccessToken || ''}">
+                
+                <button id="snp-auth-btn" style="background:#4285F4; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold;">1. Get Auth Token</button>
+                
+                <div style="display:flex; gap:8px;">
+                    <button id="snp-sync-up" style="flex:1; background:#0f9d58; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold;">↑ Backup to Drive</button>
+                    <button id="snp-sync-down" style="flex:1; background:#db4437; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold;">↓ Restore Data</button>
+                </div>
+                
+                <div id="snp-sync-status" style="text-align:center; margin-top:8px; font-size:11px; color:#ffd250; min-height:16px;"></div>
+            </div>
+        `;
+        contentContainer.appendChild(syncContent);
+        // Bind Sync Buttons
+        document.getElementById('snp-auth-btn').onclick = () => {
+            window.open(getLoginUrl(), '_blank', 'width=500,height=600');
+            document.getElementById('snp-sync-status').textContent = 'Copy the token from the URL bar after logging in, and paste it above.';
+        };
+        document.getElementById('snp-drive-token-input').onchange = (e) => {
+            driveAccessToken = e.target.value.trim();
+            GM_setValue('snp_drive_token', driveAccessToken);
+            document.getElementById('snp-sync-status').textContent = 'Token saved.';
+        };
+        document.getElementById('snp-sync-up').onclick = syncToDrive;
+        document.getElementById('snp-sync-down').onclick = syncFromDrive;
+    };
+    // Ensure Sync Tab loads after Dashboard
+    setTimeout(addSyncTab, 1500);
+    // If the user just completed OAuth and was redirected back to Sniffies with a token in the URL hash, capture it instantly.
+    if (window.location.hash.includes('access_token=')) {
+        const params = new URLSearchParams(window.location.hash.substring(1));
+        const token = params.get('access_token');
+        if (token) {
+            GM_setValue('snp_drive_token', token);
+            window.location.hash = ''; // Clear hash for privacy
+            alert("Sniffies Soft Filter: Google Drive Token captured successfully! You can close this tab if it popped up.");
+        }
+    }
+    // Initialize Dashboard after a slight delay to ensure UI is ready
+    setTimeout(injectDashboardUI, 1000);  
+    
