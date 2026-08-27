@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GreaseSniff
 // @namespace    https://sniffies.com/
-// @version      2.0.0
+// @version      2.0.1
 // @description  Advanced filtering, CRM, chat-badges, and quick phrases for Sniffies.
 // @match        https://sniffies.com/*
 // @match        https://*.sniffies.com/*
@@ -97,32 +97,25 @@
     };
 
     const showContextMenu = (x, y, targetType, profileId) => {
-        closeContextMenu(); // Close any existing menu
+        closeContextMenu(); 
 
         const menu = document.createElement('div');
         menu.id = 'snp-context-menu';
-        // Ensure menu stays within viewport bounds
         menu.style.left = `${Math.min(x, window.innerWidth - 170)}px`;
         menu.style.top = `${Math.min(y, window.innerHeight - 100)}px`;
 
-        // Action: Hide Profile
         const hideBtn = document.createElement('button');
         hideBtn.className = 'snp-context-btn danger';
         hideBtn.textContent = '🚫 Hide Profile';
         hideBtn.onclick = () => {
-            console.log(`[SniffiesFilter] Hiding profile: ${profileId}`);
-            // TODO: Hook into your blocked/hidden cache logic here
             closeContextMenu();
         };
 
-        // Action: Send Quick Phrase
         const phraseBtn = document.createElement('button');
         phraseBtn.className = 'snp-context-btn';
         phraseBtn.textContent = '💬 Send Quick Phrase';
         phraseBtn.onclick = () => {
-            console.log(`[SniffiesFilter] Opening Quick Phrase menu for: ${profileId}`);
-            // TODO: Trigger Quick Phrase floating menu logic here
-            closeContextMenu();
+            showQuickPhraseMenu(x, y, profileId);
         };
 
         menu.appendChild(phraseBtn);
@@ -131,26 +124,19 @@
         currentContextMenu = menu;
     };
 
-    // Listen for right clicks on the document
     document.addEventListener('contextmenu', (e) => {
-        // Find if we clicked on a map marker or chat list item
-        // Note: Sniffies uses data-testid="markerUserContainer" for map markers
         const marker = e.target.closest('[data-testid="markerUserContainer"]');
-        const chatRow = e.target.closest('.chat-list-item'); // Adjust selector based on current UI
+        const chatRow = e.target.closest('.chat-list-item'); 
 
         if (marker || chatRow) {
-            e.preventDefault(); // Stop standard browser right-click menu
-            
-            // Extract the profile ID (Sniffies usually binds this to the element ID or a React prop)
+            e.preventDefault(); 
             const profileId = marker ? marker.id : chatRow.dataset.userId; 
-            
             if (profileId) {
                 showContextMenu(e.clientX, e.clientY, marker ? 'marker' : 'chat', profileId);
             }
         }
     });
 
-    // Close context menu on standard clicks or scrolls
     document.addEventListener('click', (e) => {
         if (currentContextMenu && !currentContextMenu.contains(e.target)) {
             closeContextMenu();
@@ -159,35 +145,23 @@
     window.addEventListener('scroll', closeContextMenu, { passive: true });
 
     // =========================================================================
-    // INITIALIZATION
-    // =========================================================================
-    
-    const init = () => {
-        injectStyles();
-        console.log("[SniffiesFilter] Modernized V2 Loaded.");
-    };
-
-    // Run when DOM is ready
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init, { once: true });
-    } else {
-        init();
-    }
-
-})();
-// =========================================================================
     // 4. CACHES & DATA STORE
     // =========================================================================
     
-    // We store intercepted profile data here so the filter engine can read it instantly
-    const profileCache = new Map(); 
-    const chatHistoryCache = new Map(); // Tracks last chat time: { profileId: timestamp }
+    let profileCache = new Map(); 
+    let chatHistoryCache = new Map(); 
+
+    // Prevent memory leaks on long sessions
+    const pruneCaches = () => {
+        if (profileCache.size > 5000) profileCache.clear();
+        if (chatHistoryCache.size > 5000) chatHistoryCache.clear();
+    };
+    setInterval(pruneCaches, 600000); // Check every 10 mins
 
     // =========================================================================
     // 5. NETWORK INTERCEPTORS (Fetch & WebSocket)
     // =========================================================================
     
-    // Intercept Fetch API to catch profile data payloads
     const originalFetch = window.fetch;
     window.fetch = async (...args) => {
         const [resource, config] = args;
@@ -195,13 +169,9 @@
         
         try {
             const url = typeof resource === 'string' ? resource : resource?.url;
-            
-            // If Sniffies is fetching profile partials or full profiles, intercept the JSON
             if (url && (url.includes('/api/v1/users/partial') || url.includes('/api/v1/users/search'))) {
-                // Clone the response so we don't consume the stream Sniffies needs
                 const clone = response.clone();
                 clone.json().then(data => {
-                    // Sniffies usually returns an array of users or a paginated object
                     const users = Array.isArray(data) ? data : (data?.users || data?.data || []);
                     users.forEach(user => {
                         if (user && user.id) {
@@ -213,44 +183,32 @@
                             });
                         }
                     });
-                    // Trigger a filter run after new data arrives
                     requestAnimationFrame(applyFilters);
-                }).catch(() => {}); // Ignore JSON parse errors silently
+                }).catch(() => {});
             }
         } catch (err) {
             console.error("[SniffiesFilter] Fetch interceptor error:", err);
         }
-        
         return response;
     };
 
-    // Intercept WebSocket to catch incoming chat messages (for the 24h/Ever chat filters)
     const OriginalWebSocket = window.WebSocket;
     window.WebSocket = function(url, protocols) {
         const ws = new OriginalWebSocket(url, protocols);
-        
         ws.addEventListener('message', (event) => {
             try {
-                // Ignore binary data
                 if (typeof event.data !== 'string') return; 
-                
                 const payload = JSON.parse(event.data);
-                
-                // If this is a chat message event
                 if (payload && payload.type === 'chat_message' && payload.data?.senderId) {
                     const senderId = payload.data.senderId;
                     chatHistoryCache.set(senderId, Date.now());
                     requestAnimationFrame(applyFilters);
                 }
-            } catch (e) {
-                // Ignore parse errors on non-JSON websocket frames
-            }
+            } catch (e) {}
         });
-        
         return ws;
     };
     
-    // Copy over prototype methods to ensure WebSocket behaves normally
     window.WebSocket.prototype = OriginalWebSocket.prototype;
     window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
     window.WebSocket.OPEN = OriginalWebSocket.OPEN;
@@ -267,16 +225,13 @@
         return terms.some(term => profileText.includes(term));
     };
 
-    const applyFilters = () => {
+    // Changed to standard function declaration to fix Temporal Dead Zone issue
+    function applyFilters() {
         if (!appState.enabled) {
-            // If master switch is off, unhide everything
-            document.querySelectorAll('.sniffies-soft-hide').forEach(el => {
-                el.classList.remove('sniffies-soft-hide');
-            });
+            document.querySelectorAll('.sniffies-soft-hide').forEach(el => el.classList.remove('sniffies-soft-hide'));
             return;
         }
 
-        // Find all map markers and list items currently rendered on the screen
         const markers = document.querySelectorAll('[data-testid="markerUserContainer"], .chat-list-item');
         const now = Date.now();
         const oneDayMs = 24 * 60 * 60 * 1000;
@@ -289,7 +244,6 @@
             let shouldHide = false;
             let shouldHighlight = false;
 
-            // 1. Attitude / Role Filtering
             if (profile && profile.role) {
                 const role = profile.role;
                 if (appState.hideBottom && role.includes('bottom') && !role.includes('vers')) shouldHide = true;
@@ -301,21 +255,14 @@
                 if (appState.hideUnspecified && (role === '' || role === 'unspecified')) shouldHide = true;
             }
 
-            // 2. Text Exclude Filtering
             if (!shouldHide && appState.excludeProfileTermsEnabled && profile && profile.description) {
-                if (checkTextMatch(profile.description, appState.excludeProfileTerms)) {
-                    shouldHide = true;
-                }
+                if (checkTextMatch(profile.description, appState.excludeProfileTerms)) shouldHide = true;
             }
 
-            // 3. Text Include (Highlighting)
             if (!shouldHide && appState.includeProfileTermsEnabled && profile && profile.description) {
-                if (checkTextMatch(profile.description, appState.includeProfileTerms)) {
-                    shouldHighlight = true;
-                }
+                if (checkTextMatch(profile.description, appState.includeProfileTerms)) shouldHighlight = true;
             }
 
-            // 4. Chat History Filtering
             const lastChatTime = chatHistoryCache.get(profileId);
             if (lastChatTime) {
                 const timeSinceChat = now - lastChatTime;
@@ -325,18 +272,15 @@
                     shouldHide = true;
                 }
             } else if (appState.showOnlyChats) {
-                // If they want to ONLY see chats, and this person has no chat history, hide them
                 shouldHide = true;
             }
 
-            // Apply the DOM changes
             if (shouldHide) {
                 marker.classList.add('sniffies-soft-hide');
-                marker.style.boxShadow = ''; // Remove highlight if it had one
+                marker.style.boxShadow = ''; 
             } else {
                 marker.classList.remove('sniffies-soft-hide');
                 if (shouldHighlight) {
-                    // Apply a bright gold ring for text matches
                     marker.style.boxShadow = '0 0 0 3px rgba(255, 214, 10, 0.9)';
                     marker.style.borderRadius = '9999px';
                 } else {
@@ -344,13 +288,11 @@
                 }
             }
 
-            // 5. Chat-Age Badges
             if (appState.showChatAges && lastChatTime && !shouldHide && marker.hasAttribute('data-testid')) {
                 let badge = marker.querySelector('.sniffies-chat-age-badge');
                 if (!badge) {
                     badge = document.createElement('div');
                     badge.className = 'sniffies-chat-age-badge';
-                    // Style it absolutely to sit next to the marker
                     badge.style.position = 'absolute';
                     badge.style.top = '-10px';
                     badge.style.right = '-10px';
@@ -363,29 +305,25 @@
                     badge.style.zIndex = '100';
                     marker.appendChild(badge);
                 }
-                
-                // Calculate hours ago
                 const hoursAgo = Math.floor((now - lastChatTime) / (1000 * 60 * 60));
                 badge.textContent = hoursAgo < 1 ? '<1h' : `${hoursAgo}h`;
             } else {
-                // Remove badge if feature is disabled or marker is hidden
                 const badge = marker.querySelector('.sniffies-chat-age-badge');
                 if (badge) badge.remove();
             }
         });
-    };
+    }
 
-    // Run the filter engine every 2 seconds to catch DOM updates from Sniffies
-    // setInterval(applyFilters, 2000);
+    // Uncommented: Required for React SPA navigation where network requests aren't always fired
+    setInterval(applyFilters, 2000);
     
     // =========================================================================
-    // 7. CRM: BOOKMARKS & NOTES (Data Store)
+    // 7. CRM: BOOKMARKS & NOTES
     // =========================================================================
     
     const NOTES_KEY = "sniffiesSoftFilterNotes_v1";
     const BOOKMARKS_KEY = "sniffiesSoftFilterBookmarks_v1";
     
-    // Load from local storage
     let profileNotes = GM_getValue(NOTES_KEY, {}); 
     let bookmarkedProfiles = GM_getValue(BOOKMARKS_KEY, {});
 
@@ -405,30 +343,29 @@
         }
     };
 
-    // This function mimics sending a chat message by injecting text into the Sniffies chat box
     const sendChatMessage = (phrase) => {
         const chatInput = document.querySelector('textarea[placeholder*="message" i], input[placeholder*="message" i]');
-        const sendBtn = document.querySelector('button[aria-label="Send"], button[title="Send"]'); // Sniffies specific selectors
+        const sendBtn = document.querySelector('button[aria-label="Send"], button[title="Send"]');
         
         if (chatInput) {
-            // React inputs require native value setter to trigger changes
             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set 
                 || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
             
             nativeInputValueSetter.call(chatInput, phrase);
             chatInput.dispatchEvent(new Event('input', { bubbles: true }));
             
+            // Increased to 250ms to ensure React updates the DOM state before clicking
             if (sendBtn) {
-                setTimeout(() => sendBtn.click(), 100);
+                setTimeout(() => sendBtn.click(), 250);
             }
         } else {
-            console.warn("[SniffiesFilter] Chat input not found. Make sure a chat window is open.");
+            console.warn("[SniffiesFilter] Chat input not found.");
         }
     };
 
-    // Triggered by the Context Menu created in Phase 1
     const showQuickPhraseMenu = (x, y, profileId) => {
         closePhraseMenu();
+        closeContextMenu();
 
         const menu = document.createElement('div');
         menu.id = 'snp-phrase-menu';
@@ -447,7 +384,6 @@
         title.style.cssText = 'font-size: 11px; color: #8ea0ba; margin-bottom: 4px; font-weight: bold;';
         menu.appendChild(title);
 
-        // Populate phrases from state
         const phrases = appState.introMessages.split('\n').map(p => p.trim()).filter(p => p.length > 0);
         
         phrases.forEach(phrase => {
@@ -465,40 +401,29 @@
         currentPhraseMenu = menu;
     };
 
-    // Connect this to Phase 1's Context Menu!
-    // (If you look at the Phase 1 code, replace the 'TODO: Trigger Quick Phrase' line with this:)
-    // showQuickPhraseMenu(x, y, profileId);
-
     // =========================================================================
-    // 9. PROFILE VIEW INJECTOR (Notes & Bookmarks)
+    // 9. PROFILE VIEW INJECTOR
     // =========================================================================
     
-    // Sniffies renders profiles in a modal. We need to observe the DOM for it.
     const observeProfileModals = () => {
         const observer = new MutationObserver((mutations) => {
             for (let mutation of mutations) {
                 if (mutation.addedNodes.length) {
-                    // Sniffies usually wraps the open profile in a specific modal container
                     const profileModal = document.querySelector('[data-testid="profileModal"], .profile-modal-container');
-                    
-                    // Prevent duplicate injections
                     if (profileModal && !document.getElementById('snp-crm-container')) {
                         injectProfileCRM(profileModal);
                     }
                 }
             }
         });
-        
         observer.observe(document.body, { childList: true, subtree: true });
     };
 
     const injectProfileCRM = (modalNode) => {
-        // Extract the user ID from the profile modal URL or DOM 
         const match = window.location.pathname.match(/\/profile\/([a-zA-Z0-9_-]+)/);
         if (!match) return;
         const profileId = match[1];
 
-        // Create the CRM UI Container
         const crmContainer = document.createElement('div');
         crmContainer.id = 'snp-crm-container';
         crmContainer.style.cssText = `
@@ -507,7 +432,6 @@
             display: flex; flex-direction: column; gap: 8px;
         `;
 
-        // 1. Bookmark Toggle
         const isBookmarked = !!bookmarkedProfiles[profileId];
         const bookmarkBtn = document.createElement('button');
         bookmarkBtn.textContent = isBookmarked ? '⭐ Bookmarked' : '☆ Bookmark Profile';
@@ -532,7 +456,6 @@
             saveBookmarks();
         };
 
-        // 2. Personal Notes Field
         const notesArea = document.createElement('textarea');
         notesArea.placeholder = 'Add private notes here...';
         notesArea.value = profileNotes[profileId] || '';
@@ -543,42 +466,30 @@
         
         notesArea.addEventListener('input', (e) => {
             const text = e.target.value.trim();
-            if (text) {
-                profileNotes[profileId] = text;
-            } else {
-                delete profileNotes[profileId];
-            }
+            if (text) profileNotes[profileId] = text;
+            else delete profileNotes[profileId];
             saveNotes();
         });
 
         crmContainer.appendChild(bookmarkBtn);
         crmContainer.appendChild(notesArea);
 
-        // Insert at the top of the profile content
         const profileContentInfo = modalNode.querySelector('.profile-info, [data-testid="profileContent"]');
-        if (profileContentInfo) {
-            profileContentInfo.prepend(crmContainer);
-        } else {
-            modalNode.prepend(crmContainer);
-        }
+        if (profileContentInfo) profileContentInfo.prepend(crmContainer);
+        else modalNode.prepend(crmContainer);
     };
 
-    // Close phrase menu on clicks
     document.addEventListener('click', (e) => {
-        if (currentPhraseMenu && !currentPhraseMenu.contains(e.target)) {
-            closePhraseMenu();
-        }
+        if (currentPhraseMenu && !currentPhraseMenu.contains(e.target)) closePhraseMenu();
     });
 
-    // Start observing for profile modals when script loads
     observeProfileModals();
   
-  // =========================================================================
+    // =========================================================================
     // 10. MAIN SETTINGS DASHBOARD UI
     // =========================================================================
 
     const injectDashboardUI = () => {
-        // 1. Create the Launcher Button
         const launcher = document.createElement('button');
         launcher.id = 'snp-dashboard-launcher';
         launcher.textContent = '⚙️ Sniffies Filter';
@@ -593,7 +504,6 @@
         launcher.onmouseover = () => launcher.style.background = 'rgba(30, 42, 64, 0.95)';
         launcher.onmouseout = () => launcher.style.background = 'rgba(15, 20, 30, 0.95)';
 
-        // 2. Create the Dashboard Panel (Hidden by default)
         const dashboard = document.createElement('div');
         dashboard.id = 'snp-main-dashboard';
         dashboard.style.cssText = `
@@ -605,7 +515,6 @@
             font: 13px system-ui, sans-serif; overflow: hidden;
         `;
 
-        // Dashboard HTML Structure
         dashboard.innerHTML = `
             <div style="display: flex; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05);">
                 <strong style="font-size: 14px;">Sniffies Soft Filter V2</strong>
@@ -619,7 +528,6 @@
             </div>
 
             <div style="padding: 16px; overflow-y: auto; flex: 1;">
-                <!-- FILTERS TAB -->
                 <div id="snp-tab-filters" class="snp-tab-content">
                     <label style="display:flex; gap:8px; margin-bottom: 12px; font-weight:bold; color:#67d1ff;">
                         <input type="checkbox" id="snp-opt-enabled"> Master Enable Filter
@@ -653,14 +561,12 @@
                     </div>
                 </div>
 
-                <!-- PHRASES TAB -->
                 <div id="snp-tab-phrases" class="snp-tab-content" style="display:none;">
                     <strong>Quick Phrases</strong>
                     <p style="font-size:11px; color:#8ea0ba; margin: 4px 0 8px;">Enter one phrase per line. These appear in the right-click menu.</p>
                     <textarea id="snp-opt-phrases" style="width:100%; height:200px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:4px; white-space: pre;"></textarea>
                 </div>
 
-                <!-- CRM TAB -->
                 <div id="snp-tab-crm" class="snp-tab-content" style="display:none;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
                         <strong>Your Bookmarks & Notes</strong>
@@ -673,7 +579,6 @@
             </div>
         `;
 
-        // Inject Styles for Tabs
         const style = document.createElement('style');
         style.textContent = `
             .snp-tab { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; color: #8ea0ba; padding: 10px; cursor: pointer; font-weight: bold; }
@@ -687,14 +592,12 @@
         document.body.appendChild(launcher);
         document.body.appendChild(dashboard);
 
-        // 3. Bind UI Logic
         launcher.onclick = () => {
             dashboard.style.display = dashboard.style.display === 'none' ? 'flex' : 'none';
             if (dashboard.style.display === 'flex') renderCRMList();
         };
         document.getElementById('snp-dash-close').onclick = () => dashboard.style.display = 'none';
 
-        // Tab Switching
         dashboard.querySelectorAll('.snp-tab').forEach(tab => {
             tab.onclick = (e) => {
                 dashboard.querySelectorAll('.snp-tab').forEach(t => t.classList.remove('active'));
@@ -704,7 +607,6 @@
             };
         });
 
-        // 4. Bind State to Inputs
         const bindCheckbox = (id, stateKey) => {
             const el = document.getElementById(id);
             el.checked = appState[stateKey];
@@ -737,7 +639,6 @@
         bindTextarea('snp-opt-includeText', 'includeProfileTerms');
         bindTextarea('snp-opt-phrases', 'introMessages');
 
-        // 5. Render CRM List
         const renderCRMList = () => {
             const list = document.getElementById('snp-crm-list');
             list.innerHTML = '';
@@ -773,8 +674,7 @@
     // 11. GOOGLE DRIVE SYNC ENGINE
     // =========================================================================
 
-    // Note: You will need to bring over your Google Cloud Client ID from the original script
-    const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID_HERE.apps.googleusercontent.com';
+    const GOOGLE_CLIENT_ID = '269776090516-op99s4a10dd03qje3dicatb84n4ia272.apps.googleusercontent.com';
     const FILE_NAME = 'sniffies_soft_filter_backup.json';
     
     let driveAccessToken = GM_getValue('snp_drive_token', null);
@@ -784,27 +684,19 @@
         'Content-Type': 'application/json'
     });
 
-    // Generate OAuth Login URL
     const getLoginUrl = () => {
-        const redirectUri = 'https://sniffies.com'; // Or a custom local landing page
+        const redirectUri = 'https://sniffies.com'; 
         const scope = 'https://www.googleapis.com/auth/drive.appdata';
         return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=${redirectUri}&response_type=token&scope=${scope}`;
     };
 
-    // 1. Find or Create Backup File
     const getOrCreateDriveFile = async () => {
         if (!driveAccessToken) return null;
-
         try {
-            // Search for existing file
             const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='${FILE_NAME}'`, { headers: getAuthHeaders() });
             const searchData = await searchRes.json();
-
-            if (searchData.files && searchData.files.length > 0) {
-                return searchData.files[0].id;
-            }
-
-            // Create new file if it doesn't exist
+            if (searchData.files && searchData.files.length > 0) return searchData.files[0].id;
+            
             const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
                 method: 'POST',
                 headers: getAuthHeaders(),
@@ -812,14 +704,12 @@
             });
             const createData = await createRes.json();
             return createData.id;
-
         } catch (err) {
             console.error("[SniffiesFilter] Drive API Error:", err);
             return null;
         }
     };
 
-    // 2. Upload Data (Sync Up)
     const syncToDrive = async () => {
         document.getElementById('snp-sync-status').textContent = 'Syncing up... ⏳';
         const fileId = await getOrCreateDriveFile();
@@ -827,14 +717,7 @@
             document.getElementById('snp-sync-status').textContent = 'Error: Not authenticated ❌';
             return;
         }
-
-        const payload = {
-            appState,
-            profileNotes,
-            bookmarkedProfiles,
-            timestamp: Date.now()
-        };
-
+        const payload = { appState, profileNotes, bookmarkedProfiles, timestamp: Date.now() };
         try {
             await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
                 method: 'PATCH',
@@ -847,7 +730,6 @@
         }
     };
 
-    // 3. Download Data (Sync Down)
     const syncFromDrive = async () => {
         document.getElementById('snp-sync-status').textContent = 'Downloading... ⏳';
         const fileId = await getOrCreateDriveFile();
@@ -855,28 +737,18 @@
             document.getElementById('snp-sync-status').textContent = 'Error: Not authenticated ❌';
             return;
         }
-
         try {
-            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-                headers: getAuthHeaders()
-            });
-            
+            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: getAuthHeaders() });
             if (res.status === 200) {
                 const data = await res.json();
-                
-                // Merge state safely
                 appState = { ...appState, ...(data.appState || {}) };
                 profileNotes = { ...profileNotes, ...(data.profileNotes || {}) };
                 bookmarkedProfiles = { ...bookmarkedProfiles, ...(data.bookmarkedProfiles || {}) };
                 
-                saveState();
-                saveNotes();
-                saveBookmarks();
+                saveState(); saveNotes(); saveBookmarks();
                 
-                // Force UI refresh
                 document.getElementById('snp-opt-enabled').checked = appState.enabled;
                 document.getElementById('snp-refresh-crm').click();
-                
                 document.getElementById('snp-sync-status').textContent = 'Restored successfully! ✅';
             } else {
                 document.getElementById('snp-sync-status').textContent = 'No backup found ❌';
@@ -890,15 +762,12 @@
     // 12. INJECT SYNC TAB INTO DASHBOARD
     // =========================================================================
     
-    // We append the Sync Tab logic dynamically right after the Dashboard loads
     const addSyncTab = () => {
         const dash = document.getElementById('snp-main-dashboard');
         if (!dash) return;
 
-        // Add Tab Button
         const tabContainer = dash.querySelector('div:nth-child(2)');
         const syncTabBtn = document.createElement('button');
-        const GOOGLE_CLIENT_ID = '269776090516-op99s4a10dd03qje3dicatb84n4ia272.apps.googleusercontent.com'
         syncTabBtn.className = 'snp-tab';
         syncTabBtn.dataset.target = 'snp-tab-sync';
         syncTabBtn.textContent = 'Sync';
@@ -910,7 +779,6 @@
         };
         tabContainer.appendChild(syncTabBtn);
 
-        // Add Tab Content
         const contentContainer = dash.querySelector('div:nth-child(3)');
         const syncContent = document.createElement('div');
         syncContent.id = 'snp-tab-sync';
@@ -936,7 +804,6 @@
         `;
         contentContainer.appendChild(syncContent);
 
-        // Bind Sync Buttons
         document.getElementById('snp-auth-btn').onclick = () => {
             window.open(getLoginUrl(), '_blank', 'width=500,height=600');
             document.getElementById('snp-sync-status').textContent = 'Copy the token from the URL bar after logging in, and paste it above.';
@@ -952,23 +819,32 @@
         document.getElementById('snp-sync-down').onclick = syncFromDrive;
     };
 
-    // Ensure Sync Tab loads after Dashboard
-    setTimeout(addSyncTab, 1500);
+    // =========================================================================
+    // INITIALIZATION & BOOTSTRAP
+    // =========================================================================
 
-    // If the user just completed OAuth and was redirected back to Sniffies with a token in the URL hash, capture it instantly.
+    const init = () => {
+        injectStyles();
+        setTimeout(injectDashboardUI, 1000);
+        setTimeout(addSyncTab, 1500);
+        console.log("[SniffiesFilter] Modernized V2 Loaded.");
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init, { once: true });
+    } else {
+        init();
+    }
+
     if (window.location.hash.includes('access_token=')) {
         const params = new URLSearchParams(window.location.hash.substring(1));
         const token = params.get('access_token');
         if (token) {
             GM_setValue('snp_drive_token', token);
-            window.location.hash = ''; // Clear hash for privacy
+            window.location.hash = ''; 
             alert("Sniffies Soft Filter: Google Drive Token captured successfully! You can close this tab if it popped up.");
         }
     }
 
-    // Initialize Dashboard after a slight delay to ensure UI is ready
-    setTimeout(injectDashboardUI, 1000);  
-
-
-
-    
+// CRITICAL FIX: The closing wrapper is now at the very end of the file.
+})();
