@@ -25,7 +25,7 @@
     const pageWin = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const DEBUG = false; // ← set true to log intercepted URLs + WebSocket payloads
 
-    const log  = (...a) => console.log('[GreaseSniff]', ...a);
+    const log = (...a) => console.log('[GreaseSniff]', ...a);
     const warn = (...a) => console.warn('[GreaseSniff]', ...a);
 
     // Duplicate-version guard: two enabled copies cause chaos (double-patched
@@ -47,12 +47,12 @@
     // =========================================================================
     // 1. STORAGE & STATE
     // =========================================================================
-    const KEY_STATE     = 'sniffiesSoftFilterState_v2';
-    const KEY_NOTES     = 'sniffiesSoftFilterNotes_v1';
+    const KEY_STATE = 'sniffiesSoftFilterState_v2';
+    const KEY_NOTES = 'sniffiesSoftFilterNotes_v1';
     const KEY_BOOKMARKS = 'sniffiesSoftFilterBookmarks_v1';
-    const KEY_HIDDEN    = 'sniffiesHiddenProfiles_v1';
-    const KEY_CHATS     = 'sniffiesChatHistory_v1';
-    const KEY_TOKEN     = 'snp_drive_token';
+    const KEY_HIDDEN = 'sniffiesHiddenProfiles_v1';
+    const KEY_CHATS = 'sniffiesChatHistory_v1';
+    const KEY_TOKEN = 'snp_drive_token';
 
     const DEFAULT_STATE = {
         enabled: true,
@@ -71,12 +71,12 @@
     let appState = { ...DEFAULT_STATE, ...(GM_getValue(KEY_STATE, {}) || {}) };
     const saveState = () => GM_setValue(KEY_STATE, appState);
 
-    let profileNotes       = GM_getValue(KEY_NOTES, {}) || {};
+    let profileNotes = GM_getValue(KEY_NOTES, {}) || {};
     let bookmarkedProfiles = GM_getValue(KEY_BOOKMARKS, {}) || {};
-    let hiddenProfiles     = GM_getValue(KEY_HIDDEN, {}) || {};
-    const saveNotes     = () => GM_setValue(KEY_NOTES, profileNotes);
+    let hiddenProfiles = GM_getValue(KEY_HIDDEN, {}) || {};
+    const saveNotes = () => GM_setValue(KEY_NOTES, profileNotes);
     const saveBookmarks = () => GM_setValue(KEY_BOOKMARKS, bookmarkedProfiles);
-    const saveHidden    = () => GM_setValue(KEY_HIDDEN, hiddenProfiles);
+    const saveHidden = () => GM_setValue(KEY_HIDDEN, hiddenProfiles);
 
     let driveToken = GM_getValue(KEY_TOKEN, null);
 
@@ -205,7 +205,7 @@
                                 if (u && u.id) {
                                     profileCache.set(String(u.id), {
                                         name: String(u.name ?? ''),
-                                        role: u.role ?? u.attitude ?? '',   // raw; classifyRole handles format
+                                        role: u.role ?? u.attitude ?? '', // raw; classifyRole handles format
                                         description: String(u.description ?? u.about ?? '').toLowerCase()
                                     });
                                 }
@@ -335,7 +335,7 @@
             return;
         }
 
-        let hide = !!hiddenProfiles[profileId];   // right-click Hide Profile — always wins
+        let hide = !!hiddenProfiles[profileId]; // right-click Hide Profile — always wins
         let highlight = false;
 
         const profile = profileCache.get(profileId);
@@ -344,18 +344,18 @@
             const desc = String(profile.description || '');
 
             // Subcategory toggles: hide ONLY that subcategory
-            if (appState.hideSubBottom     && c.isBottom && c.isSub) hide = true;
-            if (appState.hidePowerBottom   && c.isBottom && c.isPower) hide = true;
-            if (appState.hidePassiveTop    && c.isTop && c.isPassive) hide = true;
+            if (appState.hideSubBottom && c.isBottom && c.isSub) hide = true;
+            if (appState.hidePowerBottom && c.isBottom && c.isPower) hide = true;
+            if (appState.hidePassiveTop && c.isTop && c.isPassive) hide = true;
             if (appState.hideDomTopBreeder && c.isTop && c.isDom && c.isBreeder) hide = true;
 
             // Broad categories: include their subcategories
-            if (!hide && appState.hideBottom     && c.isBottom && !c.isVers) hide = true;
+            if (!hide && appState.hideBottom && c.isBottom && !c.isVers) hide = true;
             if (!hide && appState.hideVersBottom && c.isVers && c.isBottom) hide = true;
-            if (!hide && appState.hideSide       && c.isSide) hide = true;
-            if (!hide && appState.hideTop        && c.isTop && !c.isVers) hide = true;
-            if (!hide && appState.hideVersTop    && c.isVers && c.isTop) hide = true;
-            if (!hide && appState.hideVers       && c.isVers && !c.isBottom && !c.isTop) hide = true;
+            if (!hide && appState.hideSide && c.isSide) hide = true;
+            if (!hide && appState.hideTop && c.isTop && !c.isVers) hide = true;
+            if (!hide && appState.hideVersTop && c.isVers && c.isTop) hide = true;
+            if (!hide && appState.hideVers && c.isVers && !c.isBottom && !c.isTop) hide = true;
             if (!hide && appState.hideUnspecified &&
                 !c.isBottom && !c.isTop && !c.isVers && !c.isSide) hide = true;
 
@@ -421,7 +421,7 @@
     let phraseMenu = null;
 
     function closeContextMenu() { if (contextMenu) { contextMenu.remove(); contextMenu = null; } }
-    function closePhraseMenu()  { if (phraseMenu)  { phraseMenu.remove();  phraseMenu  = null; } }
+    function closePhraseMenu() { if (phraseMenu) { phraseMenu.remove(); phraseMenu = null; } }
 
     function showContextMenu(x, y, profileId) {
         closeContextMenu();
@@ -456,7 +456,7 @@
 
         menu.append(phraseBtn, hideBtn);
         menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 180)) + 'px';
-        menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - 110)) + 'px';
+        menu.style.top = Math.max(8, Math.min(y, window.innerHeight - 110)) + 'px';
         document.body.appendChild(menu);
         contextMenu = menu;
     }
@@ -534,7 +534,7 @@
 
         document.body.appendChild(menu);
         menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 240)) + 'px';
-        menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - (menu.offsetHeight || 200) - 10)) + 'px';
+        menu.style.top = Math.max(8, Math.min(y, window.innerHeight - (menu.offsetHeight || 200) - 10)) + 'px';
         phraseMenu = menu;
     }
     // NOTE: phrases are typed into whatever conversation is currently OPEN —
@@ -749,7 +749,7 @@
             'color:#eef4ff;border:1px solid rgba(255,255,255,0.2);border-radius:20px;padding:8px 16px;' +
             'font:bold 12px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.5);';
         launcher.onmouseover = () => { launcher.style.background = 'rgba(30,42,64,0.95)'; };
-        launcher.onmouseout  = () => { launcher.style.background = 'rgba(15,20,30,0.95)'; };
+        launcher.onmouseout = () => { launcher.style.background = 'rgba(15,20,30,0.95)'; };
 
         const dashboard = document.createElement('div');
         dashboard.id = 'snp-main-dashboard';
