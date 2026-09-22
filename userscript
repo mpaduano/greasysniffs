@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GreaseSniff
 // @namespace    https://sniffies.com/
-// @version      2.1.0
-// @description  Advanced filtering, CRM, chat-badges, and quick phrases for Sniffies.
+// @version      2.3.0
+// @description  Advanced filtering, CRM, chat badges, and quick phrases for Sniffies.
 // @match        https://sniffies.com/*
 // @match        https://*.sniffies.com/*
 // @run-at       document-start
@@ -16,953 +16,111 @@
     'use strict';
 
     // =========================================================================
-    // 0. PAGE-WINDOW ACCESS & DEBUG
-    // Tampermonkey sandboxes `window` when grants are present — patching it
-    // does NOT affect the page. We must patch `unsafeWindow` so our hooks see
-    // the site's real network traffic.
+    // 0. PAGE WINDOW + DEBUG
     // =========================================================================
-    const pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-    const DEBUG = false; // set to true to log intercepted URLs + cache fills
+    const pageWin = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const DEBUG = false; // ← set true to log intercepted URLs + WebSocket payloads
+
+    const log  = (...a) => console.log('[GreaseSniff]', ...a);
+    const warn = (...a) => console.warn('[GreaseSniff]', ...a);
 
     // =========================================================================
-    // 1. STATE & CONFIGURATION
+    // 1. STORAGE & STATE  (keys unchanged — settings, notes, bookmarks carry over)
     // =========================================================================
-
-    const STATE_KEY     = "sniffiesSoftFilterState_v2";
-    const NOTES_KEY     = "sniffiesSoftFilterNotes_v1";
-    const BOOKMARKS_KEY = "sniffiesSoftFilterBookmarks_v1";
-    const HIDDEN_KEY    = "sniffiesHiddenProfiles_v1";
-    const CHAT_KEY      = "sniffiesChatHistory_v1";
-    const TOKEN_KEY     = "snp_drive_token";
+    const KEY_STATE     = 'sniffiesSoftFilterState_v2';
+    const KEY_NOTES     = 'sniffiesSoftFilterNotes_v1';
+    const KEY_BOOKMARKS = 'sniffiesSoftFilterBookmarks_v1';
+    const KEY_HIDDEN    = 'sniffiesHiddenProfiles_v1';
+    const KEY_CHATS     = 'sniffiesChatHistory_v1';
+    const KEY_TOKEN     = 'snp_drive_token';
 
     const DEFAULT_STATE = {
         enabled: true,
-        // Attitude Filters
+        // Broad attitude filters — each INCLUDES its subcategories
         hideBottom: true, hideVersBottom: true, hideSide: false,
         hideVers: false, hideVersTop: false, hideTop: false,
         hideUnspecified: false,
+        // Subcategory filters — catch ONLY that subcategory
+        hideSubBottom: false, hidePowerBottom: false,
+        hidePassiveTop: false, hideDomTopBreeder: false,
         // Text Filters
-        excludeProfileTerms: "", includeProfileTerms: "",
+        excludeProfileTerms: '', includeProfileTerms: '',
         excludeProfileTermsEnabled: true, includeProfileTermsEnabled: true,
         // Chat Filters
         hideRecentChats24h: false, hideAnyChats: false, showOnlyChats: false,
         showChatAges: true,
         // Quick Phrases
-        introMessages: ["Howdy", "Hey there", "How's your night going?", "What's up?", "Want to chat?"].join("\n")
+        introMessages: ['Howdy', 'Hey there', "How's your night going?", "What's up?", 'Want to chat?'].join('\n')
     };
 
-    let appState = { ...DEFAULT_STATE, ...(GM_getValue(STATE_KEY, {}) || {}) };
-    const saveState = () => GM_setValue(STATE_KEY, appState);
+    let appState = { ...DEFAULT_STATE, ...(GM_getValue(KEY_STATE, {}) || {}) };
+    const saveState = () => GM_setValue(KEY_STATE, appState);
 
-    let profileNotes       = GM_getValue(NOTES_KEY, {}) || {};
-    let bookmarkedProfiles = GM_getValue(BOOKMARKS_KEY, {}) || {};
-    let hiddenProfiles     = GM_getValue(HIDDEN_KEY, {}) || {};
-    const saveNotes         = () => GM_setValue(NOTES_KEY, profileNotes);
-    const saveBookmarks     = () => GM_setValue(BOOKMARKS_KEY, bookmarkedProfiles);
-    const saveHiddenProfiles = () => GM_setValue(HIDDEN_KEY, hiddenProfiles);
+    let profileNotes       = GM_getValue(KEY_NOTES, {}) || {};
+    let bookmarkedProfiles = GM_getValue(KEY_BOOKMARKS, {}) || {};
+    let hiddenProfiles     = GM_getValue(KEY_HIDDEN, {}) || {};
+    const saveNotes     = () => GM_setValue(KEY_NOTES, profileNotes);
+    const saveBookmarks = () => GM_setValue(KEY_BOOKMARKS, bookmarkedProfiles);
+    const saveHidden    = () => GM_setValue(KEY_HIDDEN, hiddenProfiles);
+
+    let driveToken = GM_getValue(KEY_TOKEN, null);
 
     // =========================================================================
     // 2. CACHES
     // =========================================================================
+    const profileCache = new Map();                                    // id -> {name, role, description}
+    let chatHistory = new Map(Object.entries(GM_getValue(KEY_CHATS, {}) || {})); // id -> lastChatMs
+    let chatDirty = false;
 
-    const profileCache = new Map(); // profileId -> {id, name, role, description}
-    // Persisted so "Hide Chatted (Ever)" survives reloads
-    const chatHistoryCache = new Map(Object.entries(GM_getValue(CHAT_KEY, {}) || {}));
-    let chatCacheDirty = false;
-
-    // Evict OLDEST entries instead of wiping everything (filtering keeps working)
-    const trimMap = (map, max) => {
-        while (map.size > max) map.delete(map.keys().next().value);
-    };
+    const trimMap = (map, max) => { while (map.size > max) map.delete(map.keys().next().value); };
 
     // =========================================================================
-    // 3. FILTER SCHEDULING (rAF-throttled)
+    // 3. HELPERS
     // =========================================================================
+    function normalizeTs(v) {
+        if (typeof v === 'number') return v > 1e12 ? v : v * 1000;      // seconds vs ms
+        if (typeof v === 'string') { const p = Date.parse(v); if (!Number.isNaN(p)) return p; }
+        return Date.now();
+    }
 
-    let filterScheduled = false;
-    function scheduleFilter() {
-        if (filterScheduled) return;
-        filterScheduled = true;
-        requestAnimationFrame(() => {
-            filterScheduled = false;
-            applyFilters();
-        });
+    // Profile-ID extraction with fallbacks
+    function getMarkerId(el) {
+        if (!el) return '';
+        let id = el.id
+            || el.dataset?.userId
+            || el.dataset?.profileId
+            || el.getAttribute?.('data-user-id')
+            || el.getAttribute?.('data-id')
+            || '';
+        if (!id) {
+            const link = el.querySelector?.('a[href*="/profile/"]');
+            if (link) {
+                const m = (link.getAttribute('href') || '').match(/\/profile\/([^/?#]+)/);
+                if (m) id = m[1];
+            }
+        }
+        return id ? String(id) : '';
+    }
+
+    function matchTerms(text, termsString) {
+        if (!termsString || !text) return false;
+        const terms = String(termsString).split('\n').map(t => t.trim().toLowerCase()).filter(Boolean);
+        return terms.some(t => text.includes(t));
     }
 
     // =========================================================================
-    // 4. NETWORK INTERCEPTORS  (top-level on purpose: must patch BEFORE the
-    //    page's own code runs, since we execute at document-start)
+    // 3b. ROLE CLASSIFICATION (token-based — the fix for subcategories)
+    //
+    // Normalizes any plausible API format into space-separated lowercase words:
+    //   "Dom Top (Breeder)"  → "dom top breeder"
+    //   "domTopBreeder"      → "dom top breeder"   (camelCase split)
+    //   "vers_bottom"        → "vers bottom"       (underscores/hyphens)
+    // Then classifies by WORDS, so broad categories naturally include their
+    // subcategories and odd formats can't slip through substring gaps.
     // =========================================================================
-
-    const originalFetch = pageWindow.fetch;
-    pageWindow.fetch = async function (...args) {
-        const response = await originalFetch.apply(pageWindow, args);
-        try {
-            const resource = args[0];
-            const url = typeof resource === 'string' ? resource
-                : (resource && typeof resource.url === 'string') ? resource.url
-                : (resource && typeof resource.href === 'string') ? resource.href
-                : '';
-            if (DEBUG) console.log('[GreaseSniff] fetch:', url);
-
-            if (url && (url.includes('/api/v1/users/partial') || url.includes('/api/v1/users/search'))) {
-                const clone = response.clone();
-                clone.json().then((data) => {
-                    const users = Array.isArray(data) ? data : (data?.users || data?.data || []);
-                    if (!Array.isArray(users)) return;
-                    users.forEach((user) => {
-                        if (user && user.id) {
-                            profileCache.set(user.id, {
-                                id: user.id,
-                                name: user.name || "",
-                                role: String(user.role ?? user.attitude ?? "").trim().toLowerCase(),
-                                description: String(user.description ?? user.about ?? "").toLowerCase()
-                            });
-                        }
-                    });
-                    if (DEBUG) console.log('[GreaseSniff] profile cache size:', profileCache.size);
-                    scheduleFilter();
-                }).catch((err) => console.warn('[GreaseSniff] response JSON parse failed:', err));
-            }
-        } catch (err) {
-            console.error('[GreaseSniff] fetch interceptor error:', err);
-        }
-        return response;
-    };
-
-    const OriginalWebSocket = pageWindow.WebSocket;
-    function PatchedWebSocket(url, protocols) {
-        const ws = new OriginalWebSocket(url, protocols);
-        ws.addEventListener('message', (event) => {
-            try {
-                if (typeof event.data !== 'string') return;
-                const payload = JSON.parse(event.data);
-                const senderId = payload?.data?.senderId;
-                if (payload?.type === 'chat_message' && senderId) {
-                    // NOTE: your own outgoing messages may carry YOUR senderId.
-                    // If your own marker starts getting hidden by chat filters,
-                    // compare senderId against your own user id here and skip.
-                    chatHistoryCache.set(senderId, Date.now());
-                    chatCacheDirty = true;
-                    scheduleFilter();
-                }
-            } catch (e) { /* not JSON / not relevant */ }
-        });
-        return ws;
-    }
-    PatchedWebSocket.prototype = OriginalWebSocket.prototype;
-    ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach((k) => {
-        try { PatchedWebSocket[k] = OriginalWebSocket[k]; } catch (e) { /* ignore */ }
-    });
-    pageWindow.WebSocket = PatchedWebSocket;
-
-    // =========================================================================
-    // 5. CORE FILTER ENGINE
-    // =========================================================================
-
-    const checkTextMatch = (profileText, termsString) => {
-        if (!termsString || !profileText) return false;
-        const terms = termsString.split('\n').map(t => t.trim().toLowerCase()).filter(t => t.length > 0);
-        return terms.some(term => profileText.includes(term));
-    };
-
-    function applyFilters() {
-        const markers = document.querySelectorAll('[data-testid="markerUserContainer"], .chat-list-item');
-        const now = Date.now();
-        const oneDayMs = 24 * 60 * 60 * 1000;
-
-        if (!appState.enabled) {
-            markers.forEach((marker) => {
-                marker.classList.remove('sniffies-soft-hide');
-                marker.style.boxShadow = '';
-                const badge = marker.querySelector('.sniffies-chat-age-badge');
-                if (badge) badge.remove();
-            });
-            return;
-        }
-
-        markers.forEach((marker) => {
-            const profileId = marker.id || marker.dataset?.userId;
-            if (!profileId) return;
-
-            const profile = profileCache.get(profileId);
-            const role = profile ? String(profile.role ?? '').trim().toLowerCase() : '';
-            const description = profile ? (profile.description || '') : '';
-
-            // "vers" matches both "vers ..." and "versatile ..." API strings
-            const isVers = role.includes('vers');
-            const isBottom = role.includes('bottom');
-            const isTop = role.includes('top');
-
-            let shouldHide = !!hiddenProfiles[profileId];
-            let shouldHighlight = false;
-
-            if (!shouldHide && profile) {
-                if (appState.hideBottom && isBottom && !isVers) shouldHide = true;
-                if (appState.hideVersBottom && isBottom && isVers) shouldHide = true;
-                if (appState.hideSide && role === 'side') shouldHide = true;
-                if (appState.hideTop && isTop && !isVers) shouldHide = true;
-                if (appState.hideVersTop && isTop && isVers) shouldHide = true;
-                if (appState.hideVers && isVers && !isBottom && !isTop) shouldHide = true;
-                if (appState.hideUnspecified && (role === '' || role === 'unspecified' || role === 'n/a')) shouldHide = true;
-
-                if (!shouldHide && appState.excludeProfileTermsEnabled && description &&
-                    checkTextMatch(description, appState.excludeProfileTerms)) shouldHide = true;
-
-                if (!shouldHide && appState.includeProfileTermsEnabled && description &&
-                    checkTextMatch(description, appState.includeProfileTerms)) shouldHighlight = true;
-            }
-
-            const lastChatTime = chatHistoryCache.get(profileId);
-            if (!shouldHide && lastChatTime) {
-                if (appState.hideAnyChats || (appState.hideRecentChats24h && (now - lastChatTime) < oneDayMs)) shouldHide = true;
-            }
-            if (!shouldHide && appState.showOnlyChats && !lastChatTime) shouldHide = true;
-
-            if (shouldHide) {
-                marker.classList.add('sniffies-soft-hide');
-                marker.style.boxShadow = '';
-                const badge = marker.querySelector('.sniffies-chat-age-badge');
-                if (badge) badge.remove();
-                return;
-            }
-
-            marker.classList.remove('sniffies-soft-hide');
-
-            if (shouldHighlight) {
-                marker.style.boxShadow = '0 0 0 3px rgba(255, 214, 10, 0.9)';
-                marker.style.borderRadius = '9999px';
-            } else {
-                marker.style.boxShadow = '';
-                marker.style.borderRadius = '';
-            }
-
-            if (appState.showChatAges && lastChatTime) {
-                let badge = marker.querySelector('.sniffies-chat-age-badge');
-                if (!badge) {
-                    badge = document.createElement('div');
-                    badge.className = 'sniffies-chat-age-badge';
-                    badge.style.cssText = 'position:absolute; top:-10px; right:-10px; background:rgba(9,16,28,0.9); color:#78d6ff; padding:2px 5px; border-radius:10px; font-size:10px; pointer-events:none; z-index:100;';
-                    marker.appendChild(badge);
-                }
-                const hoursAgo = Math.floor((now - lastChatTime) / (1000 * 60 * 60));
-                badge.textContent = hoursAgo < 1 ? '<1h' : `${hoursAgo}h`;
-            } else {
-                const badge = marker.querySelector('.sniffies-chat-age-badge');
-                if (badge) badge.remove();
-            }
-        });
-    }
-
-    // =========================================================================
-    // 6. RIGHT-CLICK CONTEXT MENU (top-level listeners are safe on `document`)
-    // =========================================================================
-
-    let currentContextMenu = null;
-
-    const closeContextMenu = () => {
-        currentContextMenu?.remove();
-        currentContextMenu = null;
-    };
-
-    const showContextMenu = (x, y, profileId) => {
-        closeContextMenu();
-
-        const menu = document.createElement('div');
-        menu.id = 'snp-context-menu';
-        menu.style.left = `${Math.min(x, window.innerWidth - 170)}px`;
-        menu.style.top = `${Math.min(y, window.innerHeight - 100)}px`;
-
-        const phraseBtn = document.createElement('button');
-        phraseBtn.className = 'snp-context-btn';
-        phraseBtn.textContent = '💬 Send Quick Phrase';
-        phraseBtn.onclick = () => showQuickPhraseMenu(x, y, profileId);
-
-        const isHidden = !!hiddenProfiles[profileId];
-        const hideBtn = document.createElement('button');
-        hideBtn.className = 'snp-context-btn danger';
-        hideBtn.textContent = isHidden ? '👁 Unhide Profile' : '🚫 Hide Profile';
-        hideBtn.onclick = () => {
-            if (isHidden) delete hiddenProfiles[profileId];
-            else hiddenProfiles[profileId] = { added: Date.now() };
-            saveHiddenProfiles();
-            scheduleFilter();
-            closeContextMenu();
-        };
-
-        menu.append(phraseBtn, hideBtn);
-        document.body.appendChild(menu);
-        currentContextMenu = menu;
-    };
-
-    document.addEventListener('contextmenu', (e) => {
-        const marker = e.target.closest('[data-testid="markerUserContainer"]');
-        const chatRow = e.target.closest('.chat-list-item');
-        if (!marker && !chatRow) return;
-
-        const profileId = marker ? marker.id : chatRow.dataset.userId;
-        if (!profileId) return;
-
-        e.preventDefault();
-        showContextMenu(e.clientX, e.clientY, profileId);
-    });
-
-    document.addEventListener('click', (e) => {
-        if (currentContextMenu && !currentContextMenu.contains(e.target)) closeContextMenu();
-        if (currentPhraseMenu && !currentPhraseMenu.contains(e.target)) closePhraseMenu();
-    });
-    window.addEventListener('scroll', closeContextMenu, { passive: true });
-
-    // =========================================================================
-    // 7. QUICK PHRASES FLOATING MENU
-    // =========================================================================
-
-    let currentPhraseMenu = null;
-
-    const closePhraseMenu = () => {
-        currentPhraseMenu?.remove();
-        currentPhraseMenu = null;
-    };
-
-    const sendChatMessage = (phrase) => {
-        const chatInput = document.querySelector('textarea[placeholder*="message" i], input[placeholder*="message" i]');
-        if (!chatInput) {
-            console.warn('[GreaseSniff] Chat input not found.');
-            return;
-        }
-
-        // Use the setter matching the element type — the textarea setter on an
-        // <input> throws "Illegal invocation".
-        const proto = (chatInput.tagName === 'TEXTAREA')
-            ? window.HTMLTextAreaElement.prototype
-            : window.HTMLInputElement.prototype;
-        const valueSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        if (valueSetter) {
-            valueSetter.call(chatInput, phrase);
-            chatInput.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-
-        const sendBtn = document.querySelector('button[aria-label="Send"], button[title="Send"]');
-        if (sendBtn) {
-            setTimeout(() => sendBtn.click(), 250); // let React sync state first
-        } else {
-            chatInput.dispatchEvent(new KeyboardEvent('keydown', {
-                key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
-            }));
-        }
-    };
-
-    const showQuickPhraseMenu = (x, y, profileId) => {
-        closePhraseMenu();
-        closeContextMenu();
-
-        const menu = document.createElement('div');
-        menu.id = 'snp-phrase-menu';
-        menu.style.cssText = `
-            position: fixed; z-index: 1000001;
-            background: rgba(12, 18, 30, 0.98);
-            border: 1px solid rgba(255,255,255,0.2); border-radius: 8px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.6); padding: 8px;
-            display: flex; flex-direction: column; gap: 6px; min-width: 200px;
-            left: ${Math.min(x, window.innerWidth - 220)}px;
-            top: ${Math.min(y, window.innerHeight - 300)}px;
-        `;
-
-        const title = document.createElement('div');
-        title.textContent = '💬 Quick Phrases';
-        title.style.cssText = 'font-size: 11px; color: #8ea0ba; margin-bottom: 4px; font-weight: bold;';
-        menu.appendChild(title);
-
-        // NOTE: sends to whatever conversation is currently OPEN, not the
-        // right-clicked person (site limitation unless we open that chat first).
-        const phrases = appState.introMessages.split('\n').map(p => p.trim()).filter(p => p.length > 0);
-        phrases.forEach((phrase) => {
-            const btn = document.createElement('button');
-            btn.className = 'snp-context-btn';
-            btn.textContent = phrase;
-            btn.onclick = () => {
-                sendChatMessage(phrase);
-                closePhraseMenu();
-            };
-            menu.appendChild(btn);
-        });
-
-        document.body.appendChild(menu);
-        currentPhraseMenu = menu;
-    };
-
-    // =========================================================================
-    // 8. PROFILE VIEW CRM (bookmarks + notes) — injected via init(), not here
-    // =========================================================================
-
-    const observeProfileModals = () => {
-        const observer = new MutationObserver(() => {
-            const profileModal = document.querySelector('[data-testid="profileModal"], .profile-modal-container');
-            if (profileModal && !document.getElementById('snp-crm-container')) {
-                injectProfileCRM(profileModal);
-            }
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-    };
-
-    const injectProfileCRM = (modalNode) => {
-        if (document.getElementById('snp-crm-container')) return;
-        const match = window.location.pathname.match(/\/profile\/([a-zA-Z0-9_-]+)/);
-        if (!match) return;
-        const profileId = match[1];
-
-        const crmContainer = document.createElement('div');
-        crmContainer.id = 'snp-crm-container';
-        crmContainer.style.cssText = `
-            background: rgba(100, 150, 255, 0.1); border-left: 3px solid rgba(100, 150, 255, 0.6);
-            padding: 10px; margin: 12px 16px; border-radius: 6px;
-            display: flex; flex-direction: column; gap: 8px;
-        `;
-
-        const isBookmarked = !!bookmarkedProfiles[profileId];
-        const bookmarkBtn = document.createElement('button');
-        const setBookmarkUI = (on) => {
-            bookmarkBtn.textContent = on ? '⭐ Bookmarked' : '☆ Bookmark Profile';
-            bookmarkBtn.style.background = on ? 'rgba(255,210,80,0.3)' : 'rgba(255,255,255,0.1)';
-            bookmarkBtn.style.color = on ? '#ffd250' : '#fff';
-        };
-        setBookmarkUI(isBookmarked);
-        bookmarkBtn.style.cssText += 'align-self: flex-start; padding: 4px 10px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold;';
-
-        bookmarkBtn.onclick = () => {
-            const nowOn = !bookmarkedProfiles[profileId];
-            if (nowOn) bookmarkedProfiles[profileId] = { added: Date.now() };
-            else delete bookmarkedProfiles[profileId];
-            setBookmarkUI(nowOn);
-            saveBookmarks();
-            renderCRMList();
-        };
-
-        const notesArea = document.createElement('textarea');
-        notesArea.placeholder = 'Add private notes here...';
-        notesArea.value = profileNotes[profileId] || '';
-        notesArea.style.cssText = `
-            width: 100%; min-height: 60px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2);
-            color: #fff; padding: 6px; border-radius: 4px; font-family: inherit; resize: vertical;
-        `;
-        notesArea.addEventListener('input', (e) => {
-            const text = e.target.value.trim();
-            if (text) profileNotes[profileId] = text;
-            else delete profileNotes[profileId];
-            saveNotes();
-        });
-
-        crmContainer.appendChild(bookmarkBtn);
-        crmContainer.appendChild(notesArea);
-
-        const profileContentInfo = modalNode.querySelector('.profile-info, [data-testid="profileContent"]');
-        if (profileContentInfo) profileContentInfo.prepend(crmContainer);
-        else modalNode.prepend(crmContainer);
-    };
-
-    // =========================================================================
-    // 9. MAIN SETTINGS DASHBOARD UI
-    // =========================================================================
-
-    const BINDINGS = [
-        ['enabled', 'checkbox'],
-        ['hideBottom', 'checkbox'], ['hideVersBottom', 'checkbox'], ['hideSide', 'checkbox'],
-        ['hideVers', 'checkbox'], ['hideVersTop', 'checkbox'], ['hideTop', 'checkbox'],
-        ['hideUnspecified', 'checkbox'],
-        ['showChatAges', 'checkbox'], ['hideRecentChats24h', 'checkbox'],
-        ['hideAnyChats', 'checkbox'], ['showOnlyChats', 'checkbox'],
-        ['excludeProfileTermsEnabled', 'checkbox'], ['includeProfileTermsEnabled', 'checkbox'],
-        ['excludeProfileTerms', 'text'], ['includeProfileTerms', 'text'],
-        ['introMessages', 'text']
-    ];
-
-    const switchTab = (targetId) => {
-        const dash = document.getElementById('snp-main-dashboard');
-        if (!dash) return;
-        dash.querySelectorAll('.snp-tab').forEach(t => t.classList.toggle('active', t.dataset.target === targetId));
-        dash.querySelectorAll('.snp-tab-content').forEach(c => { c.style.display = (c.id === targetId) ? 'block' : 'none'; });
-    };
-
-    const bindControls = () => {
-        BINDINGS.forEach(([key, type]) => {
-            const el = document.getElementById(`snp-opt-${key}`);
-            if (!el) return;
-            if (type === 'checkbox') {
-                el.checked = !!appState[key];
-                el.onchange = (e) => { appState[key] = e.target.checked; saveState(); scheduleFilter(); };
-            } else {
-                el.value = appState[key] ?? '';
-                el.addEventListener('input', (e) => { appState[key] = e.target.value; saveState(); });
-            }
-        });
-    };
-
-    // Re-syncs every control from appState (used after Drive restore)
-    const syncControlsFromState = () => {
-        BINDINGS.forEach(([key, type]) => {
-            const el = document.getElementById(`snp-opt-${key}`);
-            if (!el) return;
-            if (type === 'checkbox') el.checked = !!appState[key];
-            else el.value = appState[key] ?? '';
-        });
-    };
-
-    const renderCRMList = () => {
-        const list = document.getElementById('snp-crm-list');
-        if (!list) return;
-        list.textContent = '';
-
-        const allSavedIds = new Set([...Object.keys(bookmarkedProfiles), ...Object.keys(profileNotes)]);
-        if (allSavedIds.size === 0) {
-            const empty = document.createElement('div');
-            empty.style.cssText = 'color:#8ea0ba; text-align:center; padding:10px;';
-            empty.textContent = 'No bookmarks or notes yet.';
-            list.appendChild(empty);
-        } else {
-            allSavedIds.forEach((id) => {
-                const item = document.createElement('div');
-                item.className = 'snp-crm-item';
-
-                const row = document.createElement('div');
-                row.style.cssText = 'display:flex; justify-content:space-between; margin-bottom:4px;';
-
-                const link = document.createElement('a');
-                link.href = `/profile/${id}`;
-                link.target = '_blank';
-                link.textContent = `Profile: ${String(id).substring(0, 8)}…`;
-
-                const icon = document.createElement('span');
-                icon.textContent = bookmarkedProfiles[id] ? '⭐' : '📝';
-
-                row.append(link, icon);
-                item.appendChild(row);
-
-                const note = profileNotes[id] || '';
-                if (note) {
-                    const noteDiv = document.createElement('div');
-                    noteDiv.style.cssText = 'color:#a9b8cc; font-style:italic;';
-                    noteDiv.textContent = `"${note}"`; // textContent: safe for any characters
-                    item.appendChild(noteDiv);
-                }
-                list.appendChild(item);
-            });
-        }
-
-        const hiddenList = document.getElementById('snp-hidden-list');
-        if (hiddenList) {
-            hiddenList.textContent = '';
-            const ids = Object.keys(hiddenProfiles);
-            const header = document.createElement('div');
-            header.style.cssText = 'color:#8ea0ba; font-weight:bold;';
-            header.textContent = `Hidden profiles (${ids.length})`;
-            hiddenList.appendChild(header);
-
-            ids.forEach((id) => {
-                const row = document.createElement('div');
-                row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; gap:6px;';
-                const label = document.createElement('span');
-                label.textContent = `${String(id).substring(0, 8)}…`;
-                const btn = document.createElement('button');
-                btn.textContent = '👁 Unhide';
-                btn.style.cssText = 'background:rgba(255,255,255,0.1); color:#fff; border:none; padding:2px 8px; border-radius:4px; cursor:pointer; font-size:11px;';
-                btn.onclick = () => {
-                    delete hiddenProfiles[id];
-                    saveHiddenProfiles();
-                    renderCRMList();
-                    scheduleFilter();
-                };
-                row.append(label, btn);
-                hiddenList.appendChild(row);
-            });
-        }
-    };
-
-    const injectStyles = () => {
-        if (document.getElementById('snp-global-style')) return;
-        const style = document.createElement('style');
-        style.id = 'snp-global-style';
-        style.textContent = `
-            #snp-context-menu {
-                position: fixed;
-                z-index: 1000000;
-                background: rgba(15, 20, 30, 0.95);
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                border-radius: 8px;
-                box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-                padding: 6px;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-                min-width: 160px;
-                font: 13px system-ui, sans-serif;
-            }
-            .snp-context-btn {
-                background: transparent;
-                border: none;
-                color: #eef4ff;
-                text-align: left;
-                padding: 8px 12px;
-                border-radius: 4px;
-                cursor: pointer;
-                transition: background 0.15s ease;
-            }
-            .snp-context-btn:hover { background: rgba(255, 255, 255, 0.1); }
-            .snp-context-btn.danger:hover { background: rgba(255, 85, 85, 0.2); color: #ff7575; }
-            .sniffies-soft-hide { display: none !important; }
-        `;
-        document.head.appendChild(style);
-    };
-
-    const injectDashboardUI = () => {
-        // Self-cleaning: remove stale UI before rebuilding (watchdog safety)
-        document.getElementById('snp-dashboard-launcher')?.remove();
-        document.getElementById('snp-main-dashboard')?.remove();
-
-        if (!document.getElementById('snp-dashboard-style')) {
-            const style = document.createElement('style');
-            style.id = 'snp-dashboard-style';
-            style.textContent = `
-                .snp-tab { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; color: #8ea0ba; padding: 10px; cursor: pointer; font-weight: bold; }
-                .snp-tab.active { color: #67d1ff; border-bottom-color: #67d1ff; background: rgba(255,255,255,0.05); }
-                .snp-tab:hover:not(.active) { color: #fff; background: rgba(255,255,255,0.02); }
-                .snp-crm-item { background: rgba(255,255,255,0.05); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); }
-                .snp-crm-item a { color: #67d1ff; text-decoration: none; font-weight: bold; }
-                .snp-crm-item a:hover { text-decoration: underline; }
-            `;
-            document.head.appendChild(style);
-        }
-
-        const launcher = document.createElement('button');
-        launcher.id = 'snp-dashboard-launcher';
-        launcher.textContent = '⚙️ Sniffies Filter';
-        launcher.style.cssText = `
-            position: fixed; bottom: 20px; left: 20px; z-index: 999999;
-            background: rgba(15, 20, 30, 0.95); color: #eef4ff;
-            border: 1px solid rgba(255,255,255,0.2); border-radius: 20px;
-            padding: 8px 16px; font: bold 12px system-ui, sans-serif;
-            cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-            transition: background 0.2s;
-        `;
-        launcher.onmouseover = () => { launcher.style.background = 'rgba(30, 42, 64, 0.95)'; };
-        launcher.onmouseout = () => { launcher.style.background = 'rgba(15, 20, 30, 0.95)'; };
-
-        const dashboard = document.createElement('div');
-        dashboard.id = 'snp-main-dashboard';
-        dashboard.style.cssText = `
-            position: fixed; bottom: 60px; left: 20px; z-index: 1000000;
-            background: rgba(12, 18, 30, 0.98); color: #fff;
-            border: 1px solid rgba(255,255,255,0.2); border-radius: 12px;
-            box-shadow: 0 12px 32px rgba(0,0,0,0.7);
-            width: 340px; max-height: 70vh; display: none; flex-direction: column;
-            font: 13px system-ui, sans-serif; overflow: hidden;
-        `;
-
-        dashboard.innerHTML = `
-            <div style="display: flex; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05);">
-                <strong style="font-size: 14px;">Sniffies Soft Filter V2</strong>
-                <button id="snp-dash-close" style="background:none; border:none; color:#fff; cursor:pointer; font-weight:bold;">✕</button>
-            </div>
-
-            <div id="snp-tab-bar" style="display: flex; border-bottom: 1px solid rgba(255,255,255,0.1);">
-                <button class="snp-tab active" data-target="snp-tab-filters">Filters</button>
-                <button class="snp-tab" data-target="snp-tab-phrases">Phrases</button>
-                <button class="snp-tab" data-target="snp-tab-crm">CRM</button>
-            </div>
-
-            <div id="snp-tab-content-wrap" style="padding: 16px; overflow-y: auto; flex: 1;">
-                <div id="snp-tab-filters" class="snp-tab-content">
-                    <label style="display:flex; gap:8px; margin-bottom: 12px; font-weight:bold; color:#67d1ff;">
-                        <input type="checkbox" id="snp-opt-enabled"> Master Enable Filter
-                    </label>
-                    <div style="margin-bottom: 12px;">
-                        <strong>Attitude Filters (Hide)</strong>
-                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; font-size:12px;">
-                            <label><input type="checkbox" id="snp-opt-hideBottom"> Bottom</label>
-                            <label><input type="checkbox" id="snp-opt-hideVersBottom"> Vers Bottom</label>
-                            <label><input type="checkbox" id="snp-opt-hideSide"> Side</label>
-                            <label><input type="checkbox" id="snp-opt-hideVers"> Vers</label>
-                            <label><input type="checkbox" id="snp-opt-hideVersTop"> Vers Top</label>
-                            <label><input type="checkbox" id="snp-opt-hideTop"> Top</label>
-                            <label><input type="checkbox" id="snp-opt-hideUnspecified"> Unspecified</label>
-                        </div>
-                    </div>
-                    <div style="margin-bottom: 12px;">
-                        <strong>Chat Filters</strong>
-                        <div style="display:flex; flex-direction:column; gap: 6px; margin-top: 6px; font-size:12px;">
-                            <label><input type="checkbox" id="snp-opt-showChatAges"> Show Chat Age Badges</label>
-                            <label><input type="checkbox" id="snp-opt-hideRecentChats24h"> Hide Chatted (Last 24h)</label>
-                            <label><input type="checkbox" id="snp-opt-hideAnyChats"> Hide Chatted (Ever)</label>
-                            <label><input type="checkbox" id="snp-opt-showOnlyChats"> Show ONLY Chatted</label>
-                        </div>
-                    </div>
-                    <div style="margin-bottom: 12px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <strong>Exclude Text (Hide if found)</strong>
-                            <label style="font-size:11px;"><input type="checkbox" id="snp-opt-excludeProfileTermsEnabled"> on</label>
-                        </div>
-                        <textarea id="snp-opt-excludeProfileTerms" style="width:100%; height:50px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:4px; margin-top:4px;" placeholder="One phrase per line..."></textarea>
-                    </div>
-                    <div>
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <strong>Include Text (Gold Ring)</strong>
-                            <label style="font-size:11px;"><input type="checkbox" id="snp-opt-includeProfileTermsEnabled"> on</label>
-                        </div>
-                        <textarea id="snp-opt-includeProfileTerms" style="width:100%; height:50px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:4px; margin-top:4px;" placeholder="One phrase per line..."></textarea>
-                    </div>
-                </div>
-
-                <div id="snp-tab-phrases" class="snp-tab-content" style="display:none;">
-                    <strong>Quick Phrases</strong>
-                    <p style="font-size:11px; color:#8ea0ba; margin: 4px 0 8px;">Enter one phrase per line. These appear in the right-click menu.</p>
-                    <textarea id="snp-opt-introMessages" style="width:100%; height:200px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); border-radius:4px; white-space: pre;"></textarea>
-                </div>
-
-                <div id="snp-tab-crm" class="snp-tab-content" style="display:none;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
-                        <strong>Bookmarks & Notes</strong>
-                        <button id="snp-refresh-crm" style="background:#ff5500; color:#fff; border:none; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:11px;">Refresh</button>
-                    </div>
-                    <div id="snp-crm-list" style="display:flex; flex-direction:column; gap:8px; font-size:12px; max-height: 250px; overflow-y: auto;"></div>
-                    <div style="border-top:1px solid rgba(255,255,255,0.1); margin:10px 0 6px;"></div>
-                    <div id="snp-hidden-list" style="display:flex; flex-direction:column; gap:6px; font-size:12px; max-height:150px; overflow-y:auto;"></div>
-                </div>
-            </div>
-        `;
-
-        document.body.appendChild(launcher);
-        document.body.appendChild(dashboard);
-
-        launcher.onclick = () => {
-            const isOpen = dashboard.style.display === 'flex';
-            dashboard.style.display = isOpen ? 'none' : 'flex';
-            if (!isOpen) renderCRMList();
-        };
-        document.getElementById('snp-dash-close').onclick = () => { dashboard.style.display = 'none'; };
-        document.getElementById('snp-refresh-crm').onclick = renderCRMList;
-
-        dashboard.querySelectorAll('.snp-tab').forEach(tab => {
-            tab.onclick = () => switchTab(tab.dataset.target);
-        });
-
-        bindControls();
-        renderCRMList();
-        addSyncTab(); // built as part of injection — no race, no duplicates
-    };
-
-    const observeFilterChanges = () => {
-        // childList only: our own class toggles don't retrigger us. Badge
-        // add/remove triggers one extra converging pass, which is harmless.
-        new MutationObserver(scheduleFilter).observe(document.body, { childList: true, subtree: true });
-    };
-
-    const maintainUI = () => {
-        if (document.getElementById('snp-dashboard-launcher') && document.getElementById('snp-main-dashboard')) return;
-        injectDashboardUI();
-    };
-
-    // =========================================================================
-    // 10. GOOGLE DRIVE SYNC ENGINE
-    // =========================================================================
-
-    const GOOGLE_CLIENT_ID = 'YOUR_CLIENT_ID.apps.googleusercontent.com'; // <-- put your real client ID here
-    const FILE_NAME = 'sniffies_soft_filter_backup.json';
-
-    let driveAccessToken = GM_getValue(TOKEN_KEY, null);
-
-    const getAuthHeaders = () => ({
-        'Authorization': `Bearer ${driveAccessToken}`,
-        'Content-Type': 'application/json'
-    });
-
-    const getLoginUrl = () => {
-        const redirectUri = 'https://sniffies.com'; // must be registered on your Google OAuth client
-        const scope = 'https://www.googleapis.com/auth/drive.appdata';
-        return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=token&scope=${encodeURIComponent(scope)}`;
-    };
-
-    const setSyncStatus = (text) => {
-        const el = document.getElementById('snp-sync-status');
-        if (el) el.textContent = text;
-    };
-
-    const getOrCreateDriveFile = async () => {
-        if (!driveAccessToken) return null;
-        try {
-            const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='${FILE_NAME}'`, { headers: getAuthHeaders() });
-            const searchData = await searchRes.json();
-            if (searchData.files && searchData.files.length > 0) return searchData.files[0].id;
-
-            const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
-                method: 'POST',
-                headers: getAuthHeaders(),
-                body: JSON.stringify({ name: FILE_NAME, parents: ['appDataFolder'] })
-            });
-            const createData = await createRes.json();
-            return createData.id;
-        } catch (err) {
-            console.error('[GreaseSniff] Drive API error:', err);
-            return null;
-        }
-    };
-
-    const syncToDrive = async () => {
-        if (!driveAccessToken) { setSyncStatus('Paste a token first ❌'); return; }
-        setSyncStatus('Syncing up... ⏳');
-        const fileId = await getOrCreateDriveFile();
-        if (!fileId) { setSyncStatus('Error: Not authenticated ❌'); return; }
-        const payload = {
-            appState, profileNotes, bookmarkedProfiles, hiddenProfiles,
-            chatHistory: Object.fromEntries(chatHistoryCache),
-            timestamp: Date.now()
-        };
-        try {
-            const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
-                method: 'PATCH',
-                headers: getAuthHeaders(),
-                body: JSON.stringify(payload)
-            });
-            setSyncStatus(res.ok ? 'Backed up successfully! ✅' : `Upload failed (${res.status}) ❌`);
-        } catch (err) {
-            setSyncStatus('Upload failed ❌');
-        }
-    };
-
-    const syncFromDrive = async () => {
-        if (!driveAccessToken) { setSyncStatus('Paste a token first ❌'); return; }
-        setSyncStatus('Downloading... ⏳');
-        const fileId = await getOrCreateDriveFile();
-        if (!fileId) { setSyncStatus('Error: Not authenticated ❌'); return; }
-        try {
-            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: getAuthHeaders() });
-            if (res.status === 200) {
-                const data = await res.json();
-                appState = { ...appState, ...(data.appState || {}) };
-                profileNotes = { ...profileNotes, ...(data.profileNotes || {}) };
-                bookmarkedProfiles = { ...bookmarkedProfiles, ...(data.bookmarkedProfiles || {}) };
-                hiddenProfiles = { ...hiddenProfiles, ...(data.hiddenProfiles || {}) };
-                if (data.chatHistory) {
-                    Object.entries(data.chatHistory).forEach(([id, t]) => {
-                        const prev = chatHistoryCache.get(id) || 0;
-                        if (t > prev) chatHistoryCache.set(id, t);
-                    });
-                    chatCacheDirty = true;
-                }
-                saveState(); saveNotes(); saveBookmarks(); saveHiddenProfiles();
-
-                // Re-bind EVERY control + re-render (previously only the master toggle refreshed)
-                syncControlsFromState();
-                renderCRMList();
-                scheduleFilter();
-                setSyncStatus('Restored successfully! ✅');
-            } else if (res.status === 401) {
-                setSyncStatus('Token expired — get a new one ❌');
-            } else {
-                setSyncStatus(`Restore failed (${res.status}) ❌`);
-            }
-        } catch (err) {
-            setSyncStatus('Download failed ❌');
-        }
-    };
-
-    const addSyncTab = () => {
-        const dash = document.getElementById('snp-main-dashboard');
-        if (!dash || document.getElementById('snp-tab-sync')) return;
-
-        const tabContainer = document.getElementById('snp-tab-bar');
-        const syncTabBtn = document.createElement('button');
-        syncTabBtn.className = 'snp-tab';
-        syncTabBtn.dataset.target = 'snp-tab-sync';
-        syncTabBtn.textContent = 'Sync';
-        syncTabBtn.onclick = () => switchTab('snp-tab-sync');
-        tabContainer.appendChild(syncTabBtn);
-
-        const contentContainer = document.getElementById('snp-tab-content-wrap');
-        const syncContent = document.createElement('div');
-        syncContent.id = 'snp-tab-sync';
-        syncContent.className = 'snp-tab-content';
-        syncContent.style.display = 'none';
-
-        syncContent.innerHTML = `
-            <strong>Google Drive Backup</strong>
-            <p style="font-size:11px; color:#8ea0ba; margin: 4px 0 12px;">Sync your settings, filters, bookmarks, and chat history across devices via a hidden app folder in your Google Drive.</p>
-            <div style="display:flex; flex-direction:column; gap:10px;">
-                <input type="password" id="snp-drive-token-input" placeholder="Paste OAuth Token here..." style="background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.2); padding:6px; border-radius:4px; font-size:11px;">
-                <button id="snp-auth-btn" style="background:#4285F4; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold;">1. Get Auth Token</button>
-                <div style="display:flex; gap:8px;">
-                    <button id="snp-sync-up" style="flex:1; background:#0f9d58; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold;">↑ Backup to Drive</button>
-                    <button id="snp-sync-down" style="flex:1; background:#db4437; color:#fff; border:none; padding:8px; border-radius:4px; cursor:pointer; font-weight:bold;">↓ Restore Data</button>
-                </div>
-                <div id="snp-sync-status" style="text-align:center; margin-top:8px; font-size:11px; color:#ffd250; min-height:16px;"></div>
-            </div>
-        `;
-        contentContainer.appendChild(syncContent);
-
-        const tokenInput = document.getElementById('snp-drive-token-input');
-        tokenInput.value = driveAccessToken || '';
-
-        document.getElementById('snp-auth-btn').onclick = () => {
-            window.open(getLoginUrl(), '_blank', 'width=500,height=600');
-            setSyncStatus('Copy the token from the URL bar after logging in, and paste it above.');
-        };
-        tokenInput.onchange = (e) => {
-            driveAccessToken = e.target.value.trim();
-            GM_setValue(TOKEN_KEY, driveAccessToken);
-            setSyncStatus('Token saved.');
-        };
-        document.getElementById('snp-sync-up').onclick = syncToDrive;
-        document.getElementById('snp-sync-down').onclick = syncFromDrive;
-    };
-
-    // =========================================================================
-    // 11. INITIALIZATION & BOOTSTRAP
-    // =========================================================================
-
-    const init = () => {
-        injectStyles();
-        injectDashboardUI();
-        observeProfileModals();   // body exists now — safe
-        observeFilterChanges();
-
-        // Fallback tick: re-applies filters + maintains UI even with no mutations
-        setInterval(() => {
-            applyFilters();
-            maintainUI();
-        }, 2000);
-
-        // Periodic chat-history persistence + cache trimming
-        setInterval(() => {
-            trimMap(profileCache, 5000);
-            trimMap(chatHistoryCache, 5000);
-            if (chatCacheDirty) {
-                chatCacheDirty = false;
-                GM_setValue(CHAT_KEY, Object.fromEntries(chatHistoryCache));
-            }
-        }, 30000);
-
-        console.log('[GreaseSniff] V2.1 loaded.');
-    };
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init, { once: true });
-    } else {
-        init();
-    }
-
-    // OAuth token capture — runs at the very end of top-level evaluation so all
-    // bindings above are initialized (no TDZ issues).
-    if (window.location.hash.includes('access_token=')) {
-        try {
-            const params = new URLSearchParams(window.location.hash.substring(1));
-            const token = params.get('access_token');
-            if (token) {
-                driveAccessToken = token;
-                GM_setValue(TOKEN_KEY, token);
-                window.location.hash = '';
-                alert('GreaseSniff: Google Drive token captured! You can close this tab if it popped up.');
-            }
-        } catch (e) {
-            console.error('[GreaseSniff] token capture failed:', e);
-        }
-    }
-
-})();
+    function normalizeRole(raw) {
+        if (raw == null) return '';
+        let s;
+        if (typeof raw === 'object') {
+            // role arrived as an object/array — flatten its string values
+            s = Object.values(raw).map(v => (typeof v === 'string' ? v : '')).join('
