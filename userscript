@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GreaseSniff
 // @namespace    https://sniffies.com/
-// @version      2.3.0
+// @version      2.4.0
 // @description  Advanced filtering, CRM, chat badges, and quick phrases for Sniffies.
 // @match        https://sniffies.com/*
 // @match        https://*.sniffies.com/*
@@ -15,6 +15,10 @@
 (function () {
     'use strict';
 
+    // First beacon: if this does NOT appear in the console, the file has a
+    // syntax error or Tampermonkey isn't injecting at all.
+    console.log('[GreaseSniff] v2.4 evaluating...');
+
     // =========================================================================
     // 0. PAGE WINDOW + DEBUG
     // =========================================================================
@@ -24,8 +28,24 @@
     const log  = (...a) => console.log('[GreaseSniff]', ...a);
     const warn = (...a) => console.warn('[GreaseSniff]', ...a);
 
+    // Duplicate-version guard: two enabled copies cause chaos (double-patched
+    // fetch/WebSocket, fighting UI). If flagged, this copy stands down.
+    if (pageWin.__GREASESNIFF_ACTIVE__) {
+        console.error('[GreaseSniff] DUPLICATE: another GreaseSniff version is already running. ' +
+            'Disable older copies in the Tampermonkey dashboard, then reload this tab.');
+        const bannerWhenReady = () => showFatalBanner(
+            'Duplicate GreaseSniff detected — disable older versions in Tampermonkey, then reload.');
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', bannerWhenReady, { once: true });
+        } else {
+            bannerWhenReady();
+        }
+        return;
+    }
+    pageWin.__GREASESNIFF_ACTIVE__ = true;
+
     // =========================================================================
-    // 1. STORAGE & STATE  (keys unchanged — settings, notes, bookmarks carry over)
+    // 1. STORAGE & STATE
     // =========================================================================
     const KEY_STATE     = 'sniffiesSoftFilterState_v2';
     const KEY_NOTES     = 'sniffiesSoftFilterNotes_v1';
@@ -36,20 +56,15 @@
 
     const DEFAULT_STATE = {
         enabled: true,
-        // Broad attitude filters — each INCLUDES its subcategories
         hideBottom: true, hideVersBottom: true, hideSide: false,
         hideVers: false, hideVersTop: false, hideTop: false,
         hideUnspecified: false,
-        // Subcategory filters — catch ONLY that subcategory
         hideSubBottom: false, hidePowerBottom: false,
         hidePassiveTop: false, hideDomTopBreeder: false,
-        // Text Filters
         excludeProfileTerms: '', includeProfileTerms: '',
         excludeProfileTermsEnabled: true, includeProfileTermsEnabled: true,
-        // Chat Filters
         hideRecentChats24h: false, hideAnyChats: false, showOnlyChats: false,
         showChatAges: true,
-        // Quick Phrases
         introMessages: ['Howdy', 'Hey there', "How's your night going?", "What's up?", 'Want to chat?'].join('\n')
     };
 
@@ -68,8 +83,8 @@
     // =========================================================================
     // 2. CACHES
     // =========================================================================
-    const profileCache = new Map();                                    // id -> {name, role, description}
-    let chatHistory = new Map(Object.entries(GM_getValue(KEY_CHATS, {}) || {})); // id -> lastChatMs
+    const profileCache = new Map();
+    let chatHistory = new Map(Object.entries(GM_getValue(KEY_CHATS, {}) || {}));
     let chatDirty = false;
 
     const trimMap = (map, max) => { while (map.size > max) map.delete(map.keys().next().value); };
@@ -77,13 +92,26 @@
     // =========================================================================
     // 3. HELPERS
     // =========================================================================
+    function showFatalBanner(msg) {
+        if (!document.body) return;
+        if (document.getElementById('snp-fatal-banner')) return;
+        const banner = document.createElement('div');
+        banner.id = 'snp-fatal-banner';
+        banner.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;' +
+            'background:#c0392b;color:#fff;padding:10px 16px;border-radius:0 0 8px 8px;font:12px system-ui,sans-serif;' +
+            'max-width:80vw;box-shadow:0 4px 12px rgba(0,0,0,0.5);cursor:pointer;';
+        banner.textContent = msg;
+        banner.title = 'Click to dismiss';
+        banner.onclick = () => banner.remove();
+        document.body.appendChild(banner);
+    }
+
     function normalizeTs(v) {
-        if (typeof v === 'number') return v > 1e12 ? v : v * 1000;      // seconds vs ms
+        if (typeof v === 'number') return v > 1e12 ? v : v * 1000;
         if (typeof v === 'string') { const p = Date.parse(v); if (!Number.isNaN(p)) return p; }
         return Date.now();
     }
 
-    // Profile-ID extraction with fallbacks
     function getMarkerId(el) {
         if (!el) return '';
         let id = el.id
@@ -108,29 +136,21 @@
         return terms.some(t => text.includes(t));
     }
 
-    // =========================================================================
-    // 3b. ROLE CLASSIFICATION (token-based — the fix for subcategories)
-    //
-    // Normalizes any plausible API format into space-separated lowercase words:
-    //   "Dom Top (Breeder)"  → "dom top breeder"
-    //   "domTopBreeder"      → "dom top breeder"   (camelCase split)
-    //   "vers_bottom"        → "vers bottom"       (underscores/hyphens)
-    // Then classifies by WORDS, so broad categories naturally include their
-    // subcategories and odd formats can't slip through substring gaps.
-    // =========================================================================
+    // --- Role classification (token-based) --------------------------------
+    // Normalizes "Dom Top (Breeder)", "domTopBreeder", "dom_top_breeder" etc.
+    // into the word set {dom, top, breeder}, then classifies by WORDS.
     function normalizeRole(raw) {
         if (raw == null) return '';
         let s;
         if (typeof raw === 'object') {
-            // role arrived as an object/array — flatten its string values
             s = Object.values(raw).map(v => (typeof v === 'string' ? v : '')).join(' ');
         } else {
             s = String(raw);
         }
         return s
-            .replace(/([a-z])([A-Z])/g, '$1 $2')   // camelCase → camel Case
-            .replace(/[_\-]+/g, ' ')               // snake/kebab → space
-            .replace(/[(){}\[\]]/g, ' ')           // drop brackets, KEEP contents
+            .replace(/([a-z])([A-Z])/g, '$1 $2')
+            .replace(/[_\-]+/g, ' ')
+            .replace(/[(){}\[\]]/g, ' ')
             .toLowerCase()
             .trim();
     }
@@ -153,7 +173,7 @@
     }
 
     // =========================================================================
-    // 4. FILTER SCHEDULING (rAF-throttled so React re-renders re-filter fast)
+    // 4. FILTER SCHEDULING
     // =========================================================================
     let filterQueued = false;
     function scheduleFilter() {
@@ -163,11 +183,96 @@
     }
 
     // =========================================================================
-    // 5. NETWORK INTERCEPTORS — top level on purpose: must patch before the
-    //    page's own code runs. No DOM access here (body is null this early).
+    // 5. NETWORK INTERCEPTORS — installed in try/catch so a failure here can
+    //    never again kill the UI, filters, or right-click (the v2.3 failure).
     // =========================================================================
+    function installInterceptors() {
+        // ---- fetch ----
+        try {
+            const originalFetch = pageWin.fetch;
+            const hookedFetch = async function (...args) {
+                const response = await originalFetch.apply(this, args);
+                try {
+                    const input = args[0];
+                    const url = (typeof input === 'string') ? input : (input && input.url) || '';
+                    if (DEBUG && url) log('fetch →', url);
 
-    // Scans any JSON structure for message-shaped objects that carry a sender ID.
+                    if (url.includes('/api/v1/users/partial') || url.includes('/api/v1/users/search')) {
+                        response.clone().json().then((data) => {
+                            const users = Array.isArray(data) ? data : (data?.users || data?.data || []);
+                            if (!Array.isArray(users)) return;
+                            users.forEach((u) => {
+                                if (u && u.id) {
+                                    profileCache.set(String(u.id), {
+                                        name: String(u.name ?? ''),
+                                        role: u.role ?? u.attitude ?? '',   // raw; classifyRole handles format
+                                        description: String(u.description ?? u.about ?? '').toLowerCase()
+                                    });
+                                }
+                            });
+                            if (DEBUG) log('profiles cached:', profileCache.size);
+                            scheduleFilter();
+                        }).catch(() => {});
+                    }
+
+                    if (/chat/i.test(url)) {
+                        response.clone().json().then((data) => {
+                            const before = chatHistory.size;
+                            scanForChats(data, 0);
+                            if (chatHistory.size !== before) {
+                                chatDirty = true;
+                                if (DEBUG) log('chat cache seeded from', url, '→', chatHistory.size);
+                                scheduleFilter();
+                            }
+                        }).catch(() => {});
+                    }
+                } catch (err) {
+                    console.error('[GreaseSniff] fetch hook error:', err);
+                }
+                return response;
+            };
+            pageWin.fetch = hookedFetch;
+            log('fetch interceptor installed.');
+        } catch (err) {
+            console.error('[GreaseSniff] FAILED to install fetch interceptor:', err);
+        }
+
+        // ---- WebSocket ----
+        try {
+            const NativeWebSocket = pageWin.WebSocket;
+            function PatchedWebSocket(url, protocols) {
+                const ws = (protocols === undefined) ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+                ws.addEventListener('message', (event) => {
+                    try {
+                        if (typeof event.data !== 'string' || event.data.length > 1000000) return;
+                        const c = event.data.charCodeAt(0);
+                        if (c !== 123 && c !== 91) return;
+                        const data = JSON.parse(event.data);
+                        if (DEBUG && (PatchedWebSocket._n || 0) < 25) {
+                            PatchedWebSocket._n = (PatchedWebSocket._n || 0) + 1;
+                            log('ws ←', event.data.slice(0, 300));
+                        }
+                        const before = chatHistory.size;
+                        scanForChats(data, 0);
+                        if (chatHistory.size !== before) {
+                            chatDirty = true;
+                            scheduleFilter();
+                        }
+                    } catch (e) { /* not JSON */ }
+                });
+                return ws;
+            }
+            PatchedWebSocket.prototype = NativeWebSocket.prototype;
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach((k) => {
+                try { PatchedWebSocket[k] = NativeWebSocket[k]; } catch (e) { /* ignore */ }
+            });
+            pageWin.WebSocket = PatchedWebSocket;
+            log('WebSocket interceptor installed.');
+        } catch (err) {
+            console.error('[GreaseSniff] FAILED to install WebSocket interceptor:', err);
+        }
+    }
+
     function scanForChats(node, depth) {
         if (!node || typeof node !== 'object' || depth > 8) return;
         if (Array.isArray(node)) { node.forEach(n => scanForChats(n, depth + 1)); return; }
@@ -189,89 +294,26 @@
         for (const key of Object.keys(node)) scanForChats(node[key], depth + 1);
     }
 
-    const originalFetch = pageWin.fetch;
-    const hookedFetch = async function (...args) {
-        const response = await originalFetch.apply(this, args);
-        try {
-            const input = args[0];
-            const url = (typeof input === 'string') ? input : (input && input.url) || '';
-            if (DEBUG && url) log('fetch →', url);
-
-            // Profile data → filter cache
-            if (url.includes('/api/v1/users/partial') || url.includes('/api/v1/users/search')) {
-                response.clone().json().then((data) => {
-                    const users = Array.isArray(data) ? data : (data?.users || data?.data || []);
-                    if (!Array.isArray(users)) return;
-                    users.forEach((u) => {
-                        if (u && u.id) {
-                            profileCache.set(String(u.id), {
-                                name: String(u.name ?? ''),
-                                role: u.role ?? u.attitude ?? '',   // keep RAW — classification handles format
-                                description: String(u.description ?? u.about ?? '').toLowerCase()
-                            });
-                        }
-                    });
-                    if (DEBUG) log('profiles cached:', profileCache.size);
-                    scheduleFilter();
-                }).catch(() => {});
-            }
-
-            // Chat data → "chatted with" cache (seeds history when you open Chats)
-            if (/chat/i.test(url)) {
-                response.clone().json().then((data) => {
-                    const before = chatHistory.size;
-                    scanForChats(data, 0);
-                    if (chatHistory.size !== before) {
-                        chatDirty = true;
-                        if (DEBUG) log('chat cache seeded from', url, '→', chatHistory.size, 'people');
-                        scheduleFilter();
-                    }
-                }).catch(() => {});
-            }
-        } catch (err) {
-            console.error('[GreaseSniff] fetch hook error:', err);
-        }
-        return response;
-    };
-    pageWin.fetch = hookedFetch;
-
-    const NativeWebSocket = pageWin.WebSocket;
-    function PatchedWebSocket(url, protocols) {
-        const ws = (protocols === undefined) ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
-        ws.addEventListener('message', (event) => {
-            try {
-                if (typeof event.data !== 'string' || event.data.length > 1000000) return;
-                const c = event.data.charCodeAt(0);
-                if (c !== 123 && c !== 91) return; // not '{' or '[' — skip cheap
-                const data = JSON.parse(event.data);
-                if (DEBUG && PatchedWebSocket._n < 25) {
-                    PatchedWebSocket._n = (PatchedWebSocket._n || 0) + 1;
-                    log('ws ←', event.data.slice(0, 300));
-                }
-                const before = chatHistory.size;
-                scanForChats(data, 0);
-                if (chatHistory.size !== before) {
-                    chatDirty = true;
-                    scheduleFilter();
-                }
-            } catch (e) { /* not JSON — ignore */ }
-        });
-        return ws;
-    }
-    PatchedWebSocket.prototype = NativeWebSocket.prototype;
-    ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach((k) => {
-        try { PatchedWebSocket[k] = NativeWebSocket[k]; } catch (e) { /* ignore */ }
-    });
-    pageWin.WebSocket = PatchedWebSocket;
+    installInterceptors(); // still top-level/document-start, but now failure-isolated
 
     // =========================================================================
     // 6. FILTER ENGINE
     // =========================================================================
     let warnedEmptyChats = false;
+    let warnedEmptyProfiles = false;
 
     function applyFilters() {
         if (!document.body) return;
         const markers = document.querySelectorAll('[data-testid="markerUserContainer"], .chat-list-item');
+
+        // Direct diagnostic for "filter doesn't work": markers exist but we
+        // captured no profiles → the fetch interceptor isn't seeing data.
+        if (markers.length > 0 && profileCache.size === 0 && !warnedEmptyProfiles) {
+            warnedEmptyProfiles = true;
+            warn('Markers found but 0 profiles captured. The fetch interceptor is not seeing API data. ' +
+                'Check the P: counter on the launcher; set DEBUG = true and send me the fetch → lines.');
+        }
+
         const now = Date.now();
         const dayMs = 86400000;
         markers.forEach((m) => {
@@ -293,7 +335,7 @@
             return;
         }
 
-        let hide = !!hiddenProfiles[profileId];   // right-click "Hide Profile" — always wins
+        let hide = !!hiddenProfiles[profileId];   // right-click Hide Profile — always wins
         let highlight = false;
 
         const profile = profileCache.get(profileId);
@@ -301,14 +343,13 @@
             const c = classifyRole(profile.role);
             const desc = String(profile.description || '');
 
-            // --- Subcategory toggles: hide ONLY that specific subcategory ---
+            // Subcategory toggles: hide ONLY that subcategory
             if (appState.hideSubBottom     && c.isBottom && c.isSub) hide = true;
             if (appState.hidePowerBottom   && c.isBottom && c.isPower) hide = true;
             if (appState.hidePassiveTop    && c.isTop && c.isPassive) hide = true;
             if (appState.hideDomTopBreeder && c.isTop && c.isDom && c.isBreeder) hide = true;
 
-            // --- Broad categories: deliberately INCLUDE all subcategories ---
-            // ("Hide Top" also hides dom top, passive top, dom top (breeder)...)
+            // Broad categories: include their subcategories
             if (!hide && appState.hideBottom     && c.isBottom && !c.isVers) hide = true;
             if (!hide && appState.hideVersBottom && c.isVers && c.isBottom) hide = true;
             if (!hide && appState.hideSide       && c.isSide) hide = true;
@@ -318,7 +359,6 @@
             if (!hide && appState.hideUnspecified &&
                 !c.isBottom && !c.isTop && !c.isVers && !c.isSide) hide = true;
 
-            // --- Text filters ---
             if (!hide && appState.excludeProfileTermsEnabled && desc) {
                 if (matchTerms(desc, appState.excludeProfileTerms)) hide = true;
             }
@@ -332,13 +372,10 @@
             if (appState.hideAnyChats) hide = true;
             else if (appState.hideRecentChats24h && (now - lastChat) < dayMs) hide = true;
         }
-        // Fail-safe: with ZERO captured chat data we can't distinguish "never
-        // chatted" from "not captured" — pause instead of hiding the whole map.
         if (!hide && appState.showOnlyChats && !lastChat && chatHistory.size > 0) hide = true;
         if (appState.showOnlyChats && chatHistory.size === 0 && !warnedEmptyChats) {
             warnedEmptyChats = true;
-            warn('"Show only chatted" is ON but no chat data has been captured yet. ' +
-                 'Open the Chats page once so history can load, then check the counter in the dashboard.');
+            warn('"Show only chatted" is ON but no chat data captured yet. Open the Chats page once, then re-check.');
         }
 
         if (hide) {
@@ -388,7 +425,6 @@
 
     function showContextMenu(x, y, profileId) {
         closeContextMenu();
-        if (DEBUG) log('context menu for', profileId);
 
         const menu = document.createElement('div');
         menu.id = 'snp-context-menu';
@@ -398,7 +434,7 @@
         phraseBtn.textContent = '💬 Send Quick Phrase';
         phraseBtn.addEventListener('click', () => {
             closeContextMenu();
-            showPhraseMenu(x, y, profileId);
+            showPhraseMenu(x, y);
         });
 
         const isHidden = !!hiddenProfiles[profileId];
@@ -410,8 +446,8 @@
                 if (isHidden) delete hiddenProfiles[profileId];
                 else hiddenProfiles[profileId] = { added: Date.now() };
                 saveHidden();
-                applyFilters();   // instant feedback
-                scheduleFilter(); // and a smoothed follow-up pass
+                applyFilters();
+                scheduleFilter();
             } catch (err) {
                 console.error('[GreaseSniff] hide toggle failed:', err);
             }
@@ -432,7 +468,7 @@
             if (!marker) return;
             const profileId = getMarkerId(marker);
             if (!profileId) {
-                warn('Right-clicked a marker but could not read its profile ID. Enable DEBUG and check getMarkerId().');
+                warn('Right-clicked a marker but could not read its profile ID.');
                 return;
             }
             e.preventDefault();
@@ -501,8 +537,8 @@
         menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - (menu.offsetHeight || 200) - 10)) + 'px';
         phraseMenu = menu;
     }
-    // NOTE: quick phrases are typed into whatever conversation is currently
-    // OPEN — a Sniffies limitation, not a bug here.
+    // NOTE: phrases are typed into whatever conversation is currently OPEN —
+    // a Sniffies limitation, not a bug here.
 
     // =========================================================================
     // 8. STYLES + MAIN DASHBOARD
@@ -604,11 +640,10 @@
     }
 
     function updateLiveStats() {
-        const el = document.getElementById('snp-live-stats');
-        if (el) el.textContent = 'Chat history: ' + chatHistory.size + ' people · Profiles: ' + profileCache.size;
+        const statsEl = document.getElementById('snp-live-stats');
+        if (statsEl) statsEl.textContent = 'Profiles captured: ' + profileCache.size +
+            ' · Chat history: ' + chatHistory.size + ' people';
 
-        // "Roles seen" — shows the ACTUAL role strings the API returns, so we
-        // can verify format instead of guessing.
         const rolesEl = document.getElementById('snp-roles-seen');
         if (rolesEl) {
             const counts = new Map();
@@ -617,10 +652,18 @@
                 counts.set(r, (counts.get(r) || 0) + 1);
             });
             const lines = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
-                .map(([r, n]) => `"${r}" ×${n}`);
+                .map(([r, n]) => '"' + r + '" x' + n);
             rolesEl.textContent = lines.length
                 ? 'Roles seen: ' + lines.join(' · ')
                 : 'Roles seen: none yet (browse the map to load profiles).';
+        }
+
+        // At-a-glance health on the launcher itself (no console needed)
+        const launcherEl = document.getElementById('snp-dashboard-launcher');
+        if (launcherEl) {
+            launcherEl.textContent = '⚙️ GS · P:' + profileCache.size + ' · C:' + chatHistory.size;
+            launcherEl.title = 'P = profiles captured · C = chatted-with captured. ' +
+                'P should climb while you browse the map; C climbs after you open the Chats page.';
         }
     }
 
@@ -701,7 +744,7 @@
 
         const launcher = document.createElement('button');
         launcher.id = 'snp-dashboard-launcher';
-        launcher.textContent = '⚙️ Sniffies Filter';
+        launcher.textContent = '⚙️ GS';
         launcher.style.cssText = 'position:fixed;bottom:20px;left:20px;z-index:999999;background:rgba(15,20,30,0.95);' +
             'color:#eef4ff;border:1px solid rgba(255,255,255,0.2);border-radius:20px;padding:8px 16px;' +
             'font:bold 12px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.5);';
@@ -716,7 +759,7 @@
 
         dashboard.innerHTML = `
             <div style="display:flex;justify-content:space-between;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);">
-                <strong style="font-size:14px;">GreaseSniff v2.3</strong>
+                <strong style="font-size:14px;">GreaseSniff v2.4</strong>
                 <button id="snp-dash-close" style="background:none;border:none;color:#fff;cursor:pointer;font-weight:bold;">✕</button>
             </div>
             <div id="snp-tab-bar" style="display:flex;border-bottom:1px solid rgba(255,255,255,0.1);">
@@ -743,14 +786,14 @@
                             <label><input type="checkbox" id="snp-opt-hideTop"> Top</label>
                             <label><input type="checkbox" id="snp-opt-hideUnspecified"> Unspecified</label>
                         </div>
-                        <div style="font-size:10px;color:#8ea0ba;margin-top:6px;">Broad toggles include their subcategories (Top covers Dom Top (Breeder), Passive Top, etc.)</div>
+                        <div style="font-size:10px;color:#8ea0ba;margin-top:6px;">Broad toggles include subcategories (Top covers Dom Top (Breeder), Passive Top, etc.)</div>
                         <div style="margin-top:8px;padding-left:10px;border-left:2px solid rgba(255,255,255,0.08);display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;color:#b8c6db;">
                             <label><input type="checkbox" id="snp-opt-hideSubBottom"> Sub Bottom</label>
                             <label><input type="checkbox" id="snp-opt-hidePowerBottom"> Power Bottom</label>
                             <label><input type="checkbox" id="snp-opt-hidePassiveTop"> Passive Top</label>
                             <label><input type="checkbox" id="snp-opt-hideDomTopBreeder"> Dom Top (Breeder)</label>
                         </div>
-                        <div style="font-size:10px;color:#8ea0ba;margin-top:4px;">Subcategory toggles hide ONLY that type, even when the broad toggles are off.</div>
+                        <div style="font-size:10px;color:#8ea0ba;margin-top:4px;">Subcategory toggles hide ONLY that type.</div>
                     </div>
                     <div style="margin-bottom:12px;">
                         <strong>Chat Filters</strong>
@@ -759,7 +802,7 @@
                             <label><input type="checkbox" id="snp-opt-hideRecentChats24h"> Hide Chatted (Last 24h)</label>
                             <label><input type="checkbox" id="snp-opt-hideAnyChats"> Hide Chatted (Ever)</label>
                             <label><input type="checkbox" id="snp-opt-showOnlyChats"> Show ONLY Chatted</label>
-                            <div style="font-size:10px;color:#8ea0ba;">Chat filters need captured data — open the Chats page once per session so history loads.</div>
+                            <div style="font-size:10px;color:#8ea0ba;">Open the Chats page once per session so history can be captured.</div>
                         </div>
                     </div>
                     <div style="margin-bottom:12px;">
@@ -838,7 +881,7 @@
     }
 
     // =========================================================================
-    // 9. PROFILE MODAL CRM (bookmark + notes on profile pages)
+    // 9. PROFILE MODAL CRM
     // =========================================================================
     function observeProfileModals() {
         new MutationObserver(() => {
@@ -904,7 +947,7 @@
     });
 
     const getLoginUrl = () => {
-        const redirectUri = 'https://sniffies.com'; // must be registered on your OAuth client
+        const redirectUri = 'https://sniffies.com';
         const scope = 'https://www.googleapis.com/auth/drive.appdata';
         return 'https://accounts.google.com/o/oauth2/v2/auth?client_id=' + GOOGLE_CLIENT_ID +
             '&redirect_uri=' + encodeURIComponent(redirectUri) +
@@ -1014,8 +1057,17 @@
     }
 
     // =========================================================================
-    // 11. BOOTSTRAP
+    // 11. BOOTSTRAP — every step isolated so one failure can't kill the rest
     // =========================================================================
+    const initErrors = [];
+    function safe(fn, label) {
+        try { fn(); }
+        catch (err) {
+            initErrors.push(label + ': ' + ((err && err.message) || err));
+            console.error('[GreaseSniff] init step failed —', label, err);
+        }
+    }
+
     function startFilterObserver() {
         new MutationObserver(scheduleFilter).observe(document.body, { childList: true, subtree: true });
     }
@@ -1028,20 +1080,29 @@
     }
 
     function init() {
-        injectStyles();
-        injectDashboard();
-        observeProfileModals();
-        startFilterObserver();
-
-        setInterval(() => { applyFilters(); maintainUI(); updateLiveStats(); }, 2000);
-        setInterval(() => {
-            trimMap(profileCache, 5000);
-            trimMap(chatHistory, 5000);
-            persistChats();
-        }, 30000);
+        console.log('[GreaseSniff] init starting (DOM ready).');
+        safe(injectStyles, 'styles');
+        safe(injectDashboard, 'dashboard');
+        safe(observeProfileModals, 'profile-modal observer');
+        safe(startFilterObserver, 'filter observer');
+        safe(() => {
+            setInterval(() => {
+                try { applyFilters(); maintainUI(); updateLiveStats(); }
+                catch (err) { console.error('[GreaseSniff] tick error:', err); }
+            }, 2000);
+        }, 'main interval');
+        safe(() => {
+            setInterval(() => {
+                try { trimMap(profileCache, 5000); trimMap(chatHistory, 5000); persistChats(); }
+                catch (err) { console.error('[GreaseSniff] persistence error:', err); }
+            }, 30000);
+        }, 'persistence interval');
         window.addEventListener('pagehide', persistChats);
 
-        log('v2.3 loaded.');
+        if (initErrors.length) {
+            showFatalBanner('GreaseSniff init problems: ' + initErrors.join(' | '));
+        }
+        console.log('[GreaseSniff] v2.4 loaded. Profiles: ' + profileCache.size + ', chats: ' + chatHistory.size);
     }
 
     if (document.readyState === 'loading') {
@@ -1050,7 +1111,7 @@
         init();
     }
 
-    // OAuth token capture (runs last so all bindings above exist)
+    // OAuth token capture
     if (window.location.hash.includes('access_token=')) {
         try {
             const params = new URLSearchParams(window.location.hash.substring(1));
