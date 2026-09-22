@@ -123,4 +123,947 @@
         let s;
         if (typeof raw === 'object') {
             // role arrived as an object/array — flatten its string values
-            s = Object.values(raw).map(v => (typeof v === 'string' ? v : '')).join('
+            s = Object.values(raw).map(v => (typeof v === 'string' ? v : '')).join(' ');
+        } else {
+            s = String(raw);
+        }
+        return s
+            .replace(/([a-z])([A-Z])/g, '$1 $2')   // camelCase → camel Case
+            .replace(/[_\-]+/g, ' ')               // snake/kebab → space
+            .replace(/[(){}\[\]]/g, ' ')           // drop brackets, KEEP contents
+            .toLowerCase()
+            .trim();
+    }
+
+    function classifyRole(rawRole) {
+        const role = normalizeRole(rawRole);
+        const t = new Set(role.split(/\s+/).filter(Boolean));
+        return {
+            role,
+            isVers:    t.has('vers') || t.has('versatile'),
+            isBottom:  t.has('bottom'),
+            isTop:     t.has('top'),
+            isSide:    t.has('side'),
+            isSub:     t.has('sub') || t.has('submissive'),
+            isDom:     t.has('dom') || t.has('dominant'),
+            isPower:   t.has('power'),
+            isPassive: t.has('passive'),
+            isBreeder: t.has('breeder')
+        };
+    }
+
+    // =========================================================================
+    // 4. FILTER SCHEDULING (rAF-throttled so React re-renders re-filter fast)
+    // =========================================================================
+    let filterQueued = false;
+    function scheduleFilter() {
+        if (filterQueued) return;
+        filterQueued = true;
+        requestAnimationFrame(() => { filterQueued = false; applyFilters(); });
+    }
+
+    // =========================================================================
+    // 5. NETWORK INTERCEPTORS — top level on purpose: must patch before the
+    //    page's own code runs. No DOM access here (body is null this early).
+    // =========================================================================
+
+    // Scans any JSON structure for message-shaped objects that carry a sender ID.
+    function scanForChats(node, depth) {
+        if (!node || typeof node !== 'object' || depth > 8) return;
+        if (Array.isArray(node)) { node.forEach(n => scanForChats(n, depth + 1)); return; }
+
+        let senderId = node.senderId ?? node.sender_id ?? node.userId ?? node.user_id;
+        if (senderId == null && node.sender != null) {
+            senderId = (typeof node.sender === 'object') ? node.sender.id : node.sender;
+        }
+        const kind = String(node.type ?? node.event ?? node.action ?? '').toLowerCase();
+        const looksLikeMessage =
+            node.message != null || node.body != null ||
+            node.text != null || node.content != null;
+
+        if (senderId != null && (looksLikeMessage || kind.includes('chat') || kind.includes('message'))) {
+            const id = String(senderId);
+            const t = normalizeTs(node.createdAt ?? node.created_at ?? node.timestamp ?? node.sentAt ?? node.sent_at);
+            if (t > (chatHistory.get(id) || 0)) chatHistory.set(id, t);
+        }
+        for (const key of Object.keys(node)) scanForChats(node[key], depth + 1);
+    }
+
+    const originalFetch = pageWin.fetch;
+    const hookedFetch = async function (...args) {
+        const response = await originalFetch.apply(this, args);
+        try {
+            const input = args[0];
+            const url = (typeof input === 'string') ? input : (input && input.url) || '';
+            if (DEBUG && url) log('fetch →', url);
+
+            // Profile data → filter cache
+            if (url.includes('/api/v1/users/partial') || url.includes('/api/v1/users/search')) {
+                response.clone().json().then((data) => {
+                    const users = Array.isArray(data) ? data : (data?.users || data?.data || []);
+                    if (!Array.isArray(users)) return;
+                    users.forEach((u) => {
+                        if (u && u.id) {
+                            profileCache.set(String(u.id), {
+                                name: String(u.name ?? ''),
+                                role: u.role ?? u.attitude ?? '',   // keep RAW — classification handles format
+                                description: String(u.description ?? u.about ?? '').toLowerCase()
+                            });
+                        }
+                    });
+                    if (DEBUG) log('profiles cached:', profileCache.size);
+                    scheduleFilter();
+                }).catch(() => {});
+            }
+
+            // Chat data → "chatted with" cache (seeds history when you open Chats)
+            if (/chat/i.test(url)) {
+                response.clone().json().then((data) => {
+                    const before = chatHistory.size;
+                    scanForChats(data, 0);
+                    if (chatHistory.size !== before) {
+                        chatDirty = true;
+                        if (DEBUG) log('chat cache seeded from', url, '→', chatHistory.size, 'people');
+                        scheduleFilter();
+                    }
+                }).catch(() => {});
+            }
+        } catch (err) {
+            console.error('[GreaseSniff] fetch hook error:', err);
+        }
+        return response;
+    };
+    pageWin.fetch = hookedFetch;
+
+    const NativeWebSocket = pageWin.WebSocket;
+    function PatchedWebSocket(url, protocols) {
+        const ws = (protocols === undefined) ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+        ws.addEventListener('message', (event) => {
+            try {
+                if (typeof event.data !== 'string' || event.data.length > 1000000) return;
+                const c = event.data.charCodeAt(0);
+                if (c !== 123 && c !== 91) return; // not '{' or '[' — skip cheap
+                const data = JSON.parse(event.data);
+                if (DEBUG && PatchedWebSocket._n < 25) {
+                    PatchedWebSocket._n = (PatchedWebSocket._n || 0) + 1;
+                    log('ws ←', event.data.slice(0, 300));
+                }
+                const before = chatHistory.size;
+                scanForChats(data, 0);
+                if (chatHistory.size !== before) {
+                    chatDirty = true;
+                    scheduleFilter();
+                }
+            } catch (e) { /* not JSON — ignore */ }
+        });
+        return ws;
+    }
+    PatchedWebSocket.prototype = NativeWebSocket.prototype;
+    ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach((k) => {
+        try { PatchedWebSocket[k] = NativeWebSocket[k]; } catch (e) { /* ignore */ }
+    });
+    pageWin.WebSocket = PatchedWebSocket;
+
+    // =========================================================================
+    // 6. FILTER ENGINE
+    // =========================================================================
+    let warnedEmptyChats = false;
+
+    function applyFilters() {
+        if (!document.body) return;
+        const markers = document.querySelectorAll('[data-testid="markerUserContainer"], .chat-list-item');
+        const now = Date.now();
+        const dayMs = 86400000;
+        markers.forEach((m) => {
+            try { filterOne(m, now, dayMs); }
+            catch (err) { console.error('[GreaseSniff] filter error:', err); }
+        });
+    }
+
+    function filterOne(marker, now, dayMs) {
+        const profileId = getMarkerId(marker);
+        if (!profileId) return;
+
+        if (!appState.enabled) {
+            marker.classList.remove('sniffies-soft-hide');
+            marker.style.boxShadow = '';
+            marker.style.borderRadius = '';
+            const b = marker.querySelector('.sniffies-chat-age-badge');
+            if (b) b.remove();
+            return;
+        }
+
+        let hide = !!hiddenProfiles[profileId];   // right-click "Hide Profile" — always wins
+        let highlight = false;
+
+        const profile = profileCache.get(profileId);
+        if (!hide && profile) {
+            const c = classifyRole(profile.role);
+            const desc = String(profile.description || '');
+
+            // --- Subcategory toggles: hide ONLY that specific subcategory ---
+            if (appState.hideSubBottom     && c.isBottom && c.isSub) hide = true;
+            if (appState.hidePowerBottom   && c.isBottom && c.isPower) hide = true;
+            if (appState.hidePassiveTop    && c.isTop && c.isPassive) hide = true;
+            if (appState.hideDomTopBreeder && c.isTop && c.isDom && c.isBreeder) hide = true;
+
+            // --- Broad categories: deliberately INCLUDE all subcategories ---
+            // ("Hide Top" also hides dom top, passive top, dom top (breeder)...)
+            if (!hide && appState.hideBottom     && c.isBottom && !c.isVers) hide = true;
+            if (!hide && appState.hideVersBottom && c.isVers && c.isBottom) hide = true;
+            if (!hide && appState.hideSide       && c.isSide) hide = true;
+            if (!hide && appState.hideTop        && c.isTop && !c.isVers) hide = true;
+            if (!hide && appState.hideVersTop    && c.isVers && c.isTop) hide = true;
+            if (!hide && appState.hideVers       && c.isVers && !c.isBottom && !c.isTop) hide = true;
+            if (!hide && appState.hideUnspecified &&
+                !c.isBottom && !c.isTop && !c.isVers && !c.isSide) hide = true;
+
+            // --- Text filters ---
+            if (!hide && appState.excludeProfileTermsEnabled && desc) {
+                if (matchTerms(desc, appState.excludeProfileTerms)) hide = true;
+            }
+            if (!hide && appState.includeProfileTermsEnabled && desc) {
+                if (matchTerms(desc, appState.includeProfileTerms)) highlight = true;
+            }
+        }
+
+        const lastChat = chatHistory.get(profileId);
+        if (!hide && lastChat) {
+            if (appState.hideAnyChats) hide = true;
+            else if (appState.hideRecentChats24h && (now - lastChat) < dayMs) hide = true;
+        }
+        // Fail-safe: with ZERO captured chat data we can't distinguish "never
+        // chatted" from "not captured" — pause instead of hiding the whole map.
+        if (!hide && appState.showOnlyChats && !lastChat && chatHistory.size > 0) hide = true;
+        if (appState.showOnlyChats && chatHistory.size === 0 && !warnedEmptyChats) {
+            warnedEmptyChats = true;
+            warn('"Show only chatted" is ON but no chat data has been captured yet. ' +
+                 'Open the Chats page once so history can load, then check the counter in the dashboard.');
+        }
+
+        if (hide) {
+            marker.classList.add('sniffies-soft-hide');
+            marker.style.boxShadow = '';
+            const b = marker.querySelector('.sniffies-chat-age-badge');
+            if (b) b.remove();
+            return;
+        }
+
+        marker.classList.remove('sniffies-soft-hide');
+
+        if (highlight) {
+            marker.style.boxShadow = '0 0 0 3px rgba(255, 214, 10, 0.9)';
+            marker.style.borderRadius = '9999px';
+        } else {
+            marker.style.boxShadow = '';
+            marker.style.borderRadius = '';
+        }
+
+        if (appState.showChatAges && lastChat) {
+            let badge = marker.querySelector('.sniffies-chat-age-badge');
+            if (!badge) {
+                badge = document.createElement('div');
+                badge.className = 'sniffies-chat-age-badge';
+                badge.style.cssText = 'position:absolute;top:-10px;right:-10px;background:rgba(9,16,28,0.92);' +
+                    'color:#78d6ff;padding:2px 6px;border-radius:10px;font-size:10px;font-family:system-ui,sans-serif;' +
+                    'pointer-events:none;z-index:100;';
+                marker.appendChild(badge);
+            }
+            const hrs = Math.floor((now - lastChat) / 3600000);
+            badge.textContent = hrs < 1 ? '<1h' : hrs + 'h';
+        } else {
+            const b = marker.querySelector('.sniffies-chat-age-badge');
+            if (b) b.remove();
+        }
+    }
+
+    // =========================================================================
+    // 7. RIGHT-CLICK CONTEXT MENU + QUICK PHRASES
+    // =========================================================================
+    let contextMenu = null;
+    let phraseMenu = null;
+
+    function closeContextMenu() { if (contextMenu) { contextMenu.remove(); contextMenu = null; } }
+    function closePhraseMenu()  { if (phraseMenu)  { phraseMenu.remove();  phraseMenu  = null; } }
+
+    function showContextMenu(x, y, profileId) {
+        closeContextMenu();
+        if (DEBUG) log('context menu for', profileId);
+
+        const menu = document.createElement('div');
+        menu.id = 'snp-context-menu';
+
+        const phraseBtn = document.createElement('button');
+        phraseBtn.className = 'snp-context-btn';
+        phraseBtn.textContent = '💬 Send Quick Phrase';
+        phraseBtn.addEventListener('click', () => {
+            closeContextMenu();
+            showPhraseMenu(x, y, profileId);
+        });
+
+        const isHidden = !!hiddenProfiles[profileId];
+        const hideBtn = document.createElement('button');
+        hideBtn.className = 'snp-context-btn danger';
+        hideBtn.textContent = isHidden ? '👁 Unhide Profile' : '🚫 Hide Profile';
+        hideBtn.addEventListener('click', () => {
+            try {
+                if (isHidden) delete hiddenProfiles[profileId];
+                else hiddenProfiles[profileId] = { added: Date.now() };
+                saveHidden();
+                applyFilters();   // instant feedback
+                scheduleFilter(); // and a smoothed follow-up pass
+            } catch (err) {
+                console.error('[GreaseSniff] hide toggle failed:', err);
+            }
+            closeContextMenu();
+        });
+
+        menu.append(phraseBtn, hideBtn);
+        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 180)) + 'px';
+        menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - 110)) + 'px';
+        document.body.appendChild(menu);
+        contextMenu = menu;
+    }
+
+    document.addEventListener('contextmenu', (e) => {
+        try {
+            if (!(e.target instanceof Element)) return;
+            const marker = e.target.closest('[data-testid="markerUserContainer"], .chat-list-item');
+            if (!marker) return;
+            const profileId = getMarkerId(marker);
+            if (!profileId) {
+                warn('Right-clicked a marker but could not read its profile ID. Enable DEBUG and check getMarkerId().');
+                return;
+            }
+            e.preventDefault();
+            showContextMenu(e.clientX, e.clientY, profileId);
+        } catch (err) {
+            console.error('[GreaseSniff] contextmenu handler error:', err);
+        }
+    });
+
+    document.addEventListener('click', (e) => {
+        const t = (e.target instanceof Element) ? e.target : null;
+        if (contextMenu && (!t || !contextMenu.contains(t))) closeContextMenu();
+        if (phraseMenu && (!t || !phraseMenu.contains(t))) closePhraseMenu();
+    });
+    window.addEventListener('scroll', () => { closeContextMenu(); closePhraseMenu(); }, { passive: true });
+
+    function sendPhrase(text) {
+        const input = document.querySelector('textarea[placeholder*="message" i], input[placeholder*="message" i]');
+        if (!input) { warn('Chat input not found — open the conversation first.'); return; }
+
+        const proto = (input.tagName === 'TEXTAREA')
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(input, text);
+        else input.value = text;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+
+        const sendBtn = document.querySelector('button[aria-label*="send" i], button[title*="send" i]');
+        if (sendBtn) setTimeout(() => sendBtn.click(), 250);
+        else input.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+        }));
+    }
+
+    function showPhraseMenu(x, y) {
+        closePhraseMenu();
+        const menu = document.createElement('div');
+        menu.id = 'snp-phrase-menu';
+        menu.style.cssText = 'position:fixed;z-index:1000001;background:rgba(12,18,30,0.98);' +
+            'border:1px solid rgba(255,255,255,0.2);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.6);' +
+            'padding:8px;display:flex;flex-direction:column;gap:6px;min-width:200px;font:13px system-ui,sans-serif;';
+
+        const title = document.createElement('div');
+        title.textContent = '💬 Quick Phrases';
+        title.style.cssText = 'font-size:11px;color:#8ea0ba;font-weight:bold;';
+        menu.appendChild(title);
+
+        const phrases = String(appState.introMessages || '').split('\n').map(p => p.trim()).filter(Boolean);
+        if (phrases.length === 0) {
+            const empty = document.createElement('div');
+            empty.style.cssText = 'font-size:11px;color:#8ea0ba;';
+            empty.textContent = 'No phrases set — add them in the dashboard.';
+            menu.appendChild(empty);
+        }
+        phrases.forEach((p) => {
+            const btn = document.createElement('button');
+            btn.className = 'snp-context-btn';
+            btn.textContent = p;
+            btn.addEventListener('click', () => { sendPhrase(p); closePhraseMenu(); });
+            menu.appendChild(btn);
+        });
+
+        document.body.appendChild(menu);
+        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 240)) + 'px';
+        menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - (menu.offsetHeight || 200) - 10)) + 'px';
+        phraseMenu = menu;
+    }
+    // NOTE: quick phrases are typed into whatever conversation is currently
+    // OPEN — a Sniffies limitation, not a bug here.
+
+    // =========================================================================
+    // 8. STYLES + MAIN DASHBOARD
+    // =========================================================================
+    function injectStyles() {
+        if (document.getElementById('snp-global-style')) return;
+        const style = document.createElement('style');
+        style.id = 'snp-global-style';
+        style.textContent = `
+            #snp-context-menu, #snp-phrase-menu {
+                background: rgba(15, 20, 30, 0.97);
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 8px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+                padding: 6px;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                min-width: 160px;
+                font: 13px system-ui, sans-serif;
+            }
+            .snp-context-btn {
+                background: transparent; border: none; color: #eef4ff;
+                text-align: left; padding: 8px 12px; border-radius: 4px;
+                cursor: pointer; transition: background 0.15s ease;
+            }
+            .snp-context-btn:hover { background: rgba(255,255,255,0.1); }
+            .snp-context-btn.danger:hover { background: rgba(255,85,85,0.2); color: #ff7575; }
+            .sniffies-soft-hide { display: none !important; }
+            .snp-tab { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent;
+                       color: #8ea0ba; padding: 10px; cursor: pointer; font-weight: bold; }
+            .snp-tab.active { color: #67d1ff; border-bottom-color: #67d1ff; background: rgba(255,255,255,0.05); }
+            .snp-tab:hover:not(.active) { color: #fff; background: rgba(255,255,255,0.02); }
+            .snp-crm-item { background: rgba(255,255,255,0.05); padding: 8px; border-radius: 6px;
+                            border: 1px solid rgba(255,255,255,0.1); }
+            .snp-crm-item a { color: #67d1ff; text-decoration: none; font-weight: bold; }
+            .snp-crm-item a:hover { text-decoration: underline; }
+        `;
+        document.head.appendChild(style);
+    }
+
+    const CHECKBOXES = [
+        ['snp-opt-enabled', 'enabled'],
+        ['snp-opt-hideBottom', 'hideBottom'],
+        ['snp-opt-hideVersBottom', 'hideVersBottom'],
+        ['snp-opt-hideSide', 'hideSide'],
+        ['snp-opt-hideVers', 'hideVers'],
+        ['snp-opt-hideVersTop', 'hideVersTop'],
+        ['snp-opt-hideTop', 'hideTop'],
+        ['snp-opt-hideUnspecified', 'hideUnspecified'],
+        ['snp-opt-hideSubBottom', 'hideSubBottom'],
+        ['snp-opt-hidePowerBottom', 'hidePowerBottom'],
+        ['snp-opt-hidePassiveTop', 'hidePassiveTop'],
+        ['snp-opt-hideDomTopBreeder', 'hideDomTopBreeder'],
+        ['snp-opt-showChatAges', 'showChatAges'],
+        ['snp-opt-hideRecentChats24h', 'hideRecentChats24h'],
+        ['snp-opt-hideAnyChats', 'hideAnyChats'],
+        ['snp-opt-showOnlyChats', 'showOnlyChats'],
+        ['snp-opt-excludeProfileTermsEnabled', 'excludeProfileTermsEnabled'],
+        ['snp-opt-includeProfileTermsEnabled', 'includeProfileTermsEnabled']
+    ];
+    const TEXTAREAS = [
+        ['snp-opt-excludeProfileTerms', 'excludeProfileTerms'],
+        ['snp-opt-includeProfileTerms', 'includeProfileTerms'],
+        ['snp-opt-introMessages', 'introMessages']
+    ];
+
+    function switchTab(targetId) {
+        const dash = document.getElementById('snp-main-dashboard');
+        if (!dash) return;
+        dash.querySelectorAll('.snp-tab').forEach(t => t.classList.toggle('active', t.dataset.target === targetId));
+        dash.querySelectorAll('.snp-tab-content').forEach(c => { c.style.display = (c.id === targetId) ? 'block' : 'none'; });
+    }
+
+    function bindControls() {
+        CHECKBOXES.forEach(([id, key]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.checked = !!appState[key];
+            el.onchange = (e) => { appState[key] = e.target.checked; saveState(); scheduleFilter(); };
+        });
+        TEXTAREAS.forEach(([id, key]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.value = appState[key] ?? '';
+            el.addEventListener('input', (e) => { appState[key] = e.target.value; saveState(); });
+        });
+    }
+
+    function syncControlsFromState() {
+        CHECKBOXES.forEach(([id, key]) => {
+            const el = document.getElementById(id);
+            if (el) el.checked = !!appState[key];
+        });
+        TEXTAREAS.forEach(([id, key]) => {
+            const el = document.getElementById(id);
+            if (el) el.value = appState[key] ?? '';
+        });
+    }
+
+    function updateLiveStats() {
+        const el = document.getElementById('snp-live-stats');
+        if (el) el.textContent = 'Chat history: ' + chatHistory.size + ' people · Profiles: ' + profileCache.size;
+
+        // "Roles seen" — shows the ACTUAL role strings the API returns, so we
+        // can verify format instead of guessing.
+        const rolesEl = document.getElementById('snp-roles-seen');
+        if (rolesEl) {
+            const counts = new Map();
+            profileCache.forEach((p) => {
+                const r = normalizeRole(p.role) || '(empty)';
+                counts.set(r, (counts.get(r) || 0) + 1);
+            });
+            const lines = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
+                .map(([r, n]) => `"${r}" ×${n}`);
+            rolesEl.textContent = lines.length
+                ? 'Roles seen: ' + lines.join(' · ')
+                : 'Roles seen: none yet (browse the map to load profiles).';
+        }
+    }
+
+    function renderCRM() {
+        const list = document.getElementById('snp-crm-list');
+        if (list) {
+            list.textContent = '';
+            const ids = new Set([...Object.keys(bookmarkedProfiles), ...Object.keys(profileNotes)]);
+            if (ids.size === 0) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'color:#8ea0ba;text-align:center;padding:10px;';
+                empty.textContent = 'No bookmarks or notes yet.';
+                list.appendChild(empty);
+            } else {
+                ids.forEach((id) => {
+                    const item = document.createElement('div');
+                    item.className = 'snp-crm-item';
+                    const row = document.createElement('div');
+                    row.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:4px;';
+                    const link = document.createElement('a');
+                    link.href = '/profile/' + id;
+                    link.target = '_blank';
+                    link.textContent = 'Profile ' + String(id).substring(0, 8) + '…';
+                    const icon = document.createElement('span');
+                    icon.textContent = bookmarkedProfiles[id] ? '⭐' : '📝';
+                    row.append(link, icon);
+                    item.appendChild(row);
+                    const note = profileNotes[id];
+                    if (note) {
+                        const noteDiv = document.createElement('div');
+                        noteDiv.style.cssText = 'color:#a9b8cc;font-style:italic;';
+                        noteDiv.textContent = '"' + note + '"';
+                        item.appendChild(noteDiv);
+                    }
+                    list.appendChild(item);
+                });
+            }
+        }
+
+        const hiddenList = document.getElementById('snp-hidden-list');
+        if (hiddenList) {
+            hiddenList.textContent = '';
+            const hiddenIds = Object.keys(hiddenProfiles);
+            const header = document.createElement('div');
+            header.style.cssText = 'color:#8ea0ba;font-weight:bold;';
+            header.textContent = 'Hidden profiles (' + hiddenIds.length + ')';
+            hiddenList.appendChild(header);
+            if (hiddenIds.length === 0) {
+                const none = document.createElement('div');
+                none.style.cssText = 'color:#5c6c84;';
+                none.textContent = 'None — right-click a marker to hide one.';
+                hiddenList.appendChild(none);
+            }
+            hiddenIds.forEach((id) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:6px;';
+                const label = document.createElement('span');
+                label.textContent = String(id).substring(0, 8) + '…';
+                const btn = document.createElement('button');
+                btn.textContent = 'Unhide';
+                btn.style.cssText = 'background:rgba(255,255,255,0.1);color:#fff;border:none;padding:2px 8px;' +
+                    'border-radius:4px;cursor:pointer;font-size:11px;';
+                btn.addEventListener('click', () => {
+                    delete hiddenProfiles[id];
+                    saveHidden();
+                    renderCRM();
+                    scheduleFilter();
+                });
+                row.append(label, btn);
+                hiddenList.appendChild(row);
+            });
+        }
+    }
+
+    function injectDashboard() {
+        document.getElementById('snp-dashboard-launcher')?.remove();
+        document.getElementById('snp-main-dashboard')?.remove();
+
+        const launcher = document.createElement('button');
+        launcher.id = 'snp-dashboard-launcher';
+        launcher.textContent = '⚙️ Sniffies Filter';
+        launcher.style.cssText = 'position:fixed;bottom:20px;left:20px;z-index:999999;background:rgba(15,20,30,0.95);' +
+            'color:#eef4ff;border:1px solid rgba(255,255,255,0.2);border-radius:20px;padding:8px 16px;' +
+            'font:bold 12px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.5);';
+        launcher.onmouseover = () => { launcher.style.background = 'rgba(30,42,64,0.95)'; };
+        launcher.onmouseout  = () => { launcher.style.background = 'rgba(15,20,30,0.95)'; };
+
+        const dashboard = document.createElement('div');
+        dashboard.id = 'snp-main-dashboard';
+        dashboard.style.cssText = 'position:fixed;bottom:60px;left:20px;z-index:1000000;background:rgba(12,18,30,0.98);' +
+            'color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,0.7);' +
+            'width:340px;max-height:70vh;display:none;flex-direction:column;font:13px system-ui,sans-serif;overflow:hidden;';
+
+        dashboard.innerHTML = `
+            <div style="display:flex;justify-content:space-between;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);">
+                <strong style="font-size:14px;">GreaseSniff v2.3</strong>
+                <button id="snp-dash-close" style="background:none;border:none;color:#fff;cursor:pointer;font-weight:bold;">✕</button>
+            </div>
+            <div id="snp-tab-bar" style="display:flex;border-bottom:1px solid rgba(255,255,255,0.1);">
+                <button class="snp-tab active" data-target="snp-tab-filters">Filters</button>
+                <button class="snp-tab" data-target="snp-tab-phrases">Phrases</button>
+                <button class="snp-tab" data-target="snp-tab-crm">CRM</button>
+                <button class="snp-tab" data-target="snp-tab-sync">Sync</button>
+            </div>
+            <div id="snp-tab-panels" style="padding:16px;overflow-y:auto;flex:1;">
+                <div id="snp-tab-filters" class="snp-tab-content">
+                    <div id="snp-live-stats" style="font-size:11px;color:#8ea0ba;margin-bottom:4px;"></div>
+                    <div id="snp-roles-seen" style="font-size:10px;color:#6d7f99;margin-bottom:10px;word-break:break-word;"></div>
+                    <label style="display:flex;gap:8px;margin-bottom:12px;font-weight:bold;color:#67d1ff;">
+                        <input type="checkbox" id="snp-opt-enabled"> Master Enable Filter
+                    </label>
+                    <div style="margin-bottom:12px;">
+                        <strong>Attitude Filters (Hide)</strong>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;font-size:12px;">
+                            <label><input type="checkbox" id="snp-opt-hideBottom"> Bottom</label>
+                            <label><input type="checkbox" id="snp-opt-hideVersBottom"> Vers Bottom</label>
+                            <label><input type="checkbox" id="snp-opt-hideSide"> Side</label>
+                            <label><input type="checkbox" id="snp-opt-hideVers"> Vers</label>
+                            <label><input type="checkbox" id="snp-opt-hideVersTop"> Vers Top</label>
+                            <label><input type="checkbox" id="snp-opt-hideTop"> Top</label>
+                            <label><input type="checkbox" id="snp-opt-hideUnspecified"> Unspecified</label>
+                        </div>
+                        <div style="font-size:10px;color:#8ea0ba;margin-top:6px;">Broad toggles include their subcategories (Top covers Dom Top (Breeder), Passive Top, etc.)</div>
+                        <div style="margin-top:8px;padding-left:10px;border-left:2px solid rgba(255,255,255,0.08);display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;color:#b8c6db;">
+                            <label><input type="checkbox" id="snp-opt-hideSubBottom"> Sub Bottom</label>
+                            <label><input type="checkbox" id="snp-opt-hidePowerBottom"> Power Bottom</label>
+                            <label><input type="checkbox" id="snp-opt-hidePassiveTop"> Passive Top</label>
+                            <label><input type="checkbox" id="snp-opt-hideDomTopBreeder"> Dom Top (Breeder)</label>
+                        </div>
+                        <div style="font-size:10px;color:#8ea0ba;margin-top:4px;">Subcategory toggles hide ONLY that type, even when the broad toggles are off.</div>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <strong>Chat Filters</strong>
+                        <div style="display:flex;flex-direction:column;gap:6px;margin-top:6px;font-size:12px;">
+                            <label><input type="checkbox" id="snp-opt-showChatAges"> Show Chat Age Badges</label>
+                            <label><input type="checkbox" id="snp-opt-hideRecentChats24h"> Hide Chatted (Last 24h)</label>
+                            <label><input type="checkbox" id="snp-opt-hideAnyChats"> Hide Chatted (Ever)</label>
+                            <label><input type="checkbox" id="snp-opt-showOnlyChats"> Show ONLY Chatted</label>
+                            <div style="font-size:10px;color:#8ea0ba;">Chat filters need captured data — open the Chats page once per session so history loads.</div>
+                        </div>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <strong>Exclude Text (Hide if found)</strong>
+                            <label style="font-size:11px;"><input type="checkbox" id="snp-opt-excludeProfileTermsEnabled"> on</label>
+                        </div>
+                        <textarea id="snp-opt-excludeProfileTerms" style="width:100%;height:50px;background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:4px;margin-top:4px;" placeholder="One phrase per line..."></textarea>
+                    </div>
+                    <div>
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <strong>Include Text (Gold Ring)</strong>
+                            <label style="font-size:11px;"><input type="checkbox" id="snp-opt-includeProfileTermsEnabled"> on</label>
+                        </div>
+                        <textarea id="snp-opt-includeProfileTerms" style="width:100%;height:50px;background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:4px;margin-top:4px;" placeholder="One phrase per line..."></textarea>
+                    </div>
+                </div>
+
+                <div id="snp-tab-phrases" class="snp-tab-content" style="display:none;">
+                    <strong>Quick Phrases</strong>
+                    <p style="font-size:11px;color:#8ea0ba;margin:4px 0 8px;">One phrase per line. They appear when you right-click a marker. Note: phrases are sent to whatever conversation is currently open.</p>
+                    <textarea id="snp-opt-introMessages" style="width:100%;height:200px;background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:4px;white-space:pre;"></textarea>
+                </div>
+
+                <div id="snp-tab-crm" class="snp-tab-content" style="display:none;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                        <strong>Bookmarks &amp; Notes</strong>
+                        <button id="snp-refresh-crm" style="background:#ff5500;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;">Refresh</button>
+                    </div>
+                    <div id="snp-crm-list" style="display:flex;flex-direction:column;gap:8px;font-size:12px;max-height:250px;overflow-y:auto;"></div>
+                    <div style="border-top:1px solid rgba(255,255,255,0.1);margin:10px 0 6px;"></div>
+                    <div id="snp-hidden-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px;max-height:150px;overflow-y:auto;"></div>
+                </div>
+
+                <div id="snp-tab-sync" class="snp-tab-content" style="display:none;">
+                    <strong>Google Drive Backup</strong>
+                    <p style="font-size:11px;color:#8ea0ba;margin:4px 0 12px;">Sync settings, notes, bookmarks, hidden profiles, and chat history via a hidden app folder in your Drive.</p>
+                    <div style="display:flex;flex-direction:column;gap:10px;">
+                        <input type="password" id="snp-drive-token-input" placeholder="Paste OAuth Token here..." style="background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);padding:6px;border-radius:4px;font-size:11px;">
+                        <button id="snp-auth-btn" style="background:#4285F4;color:#fff;border:none;padding:8px;border-radius:4px;cursor:pointer;font-weight:bold;">1. Get Auth Token</button>
+                        <div style="display:flex;gap:8px;">
+                            <button id="snp-sync-up" style="flex:1;background:#0f9d58;color:#fff;border:none;padding:8px;border-radius:4px;cursor:pointer;font-weight:bold;">↑ Backup</button>
+                            <button id="snp-sync-down" style="flex:1;background:#db4437;color:#fff;border:none;padding:8px;border-radius:4px;cursor:pointer;font-weight:bold;">↓ Restore</button>
+                        </div>
+                        <div id="snp-sync-status" style="text-align:center;font-size:11px;color:#ffd250;min-height:16px;"></div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(launcher);
+        document.body.appendChild(dashboard);
+
+        launcher.onclick = () => {
+            const isOpen = dashboard.style.display === 'flex';
+            dashboard.style.display = isOpen ? 'none' : 'flex';
+            if (!isOpen) { renderCRM(); updateLiveStats(); }
+        };
+        document.getElementById('snp-dash-close').onclick = () => { dashboard.style.display = 'none'; };
+        document.getElementById('snp-refresh-crm').onclick = renderCRM;
+
+        dashboard.querySelectorAll('.snp-tab').forEach(tab => {
+            tab.onclick = () => switchTab(tab.dataset.target);
+        });
+
+        bindControls();
+        bindSyncControls();
+        renderCRM();
+        updateLiveStats();
+    }
+
+    function maintainUI() {
+        if (!document.getElementById('snp-dashboard-launcher') || !document.getElementById('snp-main-dashboard')) {
+            injectDashboard();
+        }
+    }
+
+    // =========================================================================
+    // 9. PROFILE MODAL CRM (bookmark + notes on profile pages)
+    // =========================================================================
+    function observeProfileModals() {
+        new MutationObserver(() => {
+            const modal = document.querySelector('[data-testid="profileModal"], .profile-modal-container');
+            if (modal && !document.getElementById('snp-crm-container')) injectProfileCRM(modal);
+        }).observe(document.body, { childList: true, subtree: true });
+    }
+
+    function injectProfileCRM(modal) {
+        const match = window.location.pathname.match(/\/profile\/([a-zA-Z0-9_-]+)/);
+        if (!match) return;
+        const profileId = match[1];
+
+        const container = document.createElement('div');
+        container.id = 'snp-crm-container';
+        container.style.cssText = 'background:rgba(100,150,255,0.1);border-left:3px solid rgba(100,150,255,0.6);' +
+            'padding:10px;margin:12px 16px;border-radius:6px;display:flex;flex-direction:column;gap:8px;';
+
+        const bookmarkBtn = document.createElement('button');
+        const setBookmarkUI = (on) => {
+            bookmarkBtn.textContent = on ? '⭐ Bookmarked' : '☆ Bookmark Profile';
+            bookmarkBtn.style.background = on ? 'rgba(255,210,80,0.3)' : 'rgba(255,255,255,0.1)';
+            bookmarkBtn.style.color = on ? '#ffd250' : '#fff';
+        };
+        setBookmarkUI(!!bookmarkedProfiles[profileId]);
+        bookmarkBtn.style.cssText += 'align-self:flex-start;padding:4px 10px;border-radius:4px;border:none;cursor:pointer;font-weight:bold;';
+        bookmarkBtn.onclick = () => {
+            const nowOn = !bookmarkedProfiles[profileId];
+            if (nowOn) bookmarkedProfiles[profileId] = { added: Date.now() };
+            else delete bookmarkedProfiles[profileId];
+            setBookmarkUI(nowOn);
+            saveBookmarks();
+        };
+
+        const notesArea = document.createElement('textarea');
+        notesArea.placeholder = 'Add private notes here...';
+        notesArea.value = profileNotes[profileId] || '';
+        notesArea.style.cssText = 'width:100%;min-height:60px;background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.2);' +
+            'color:#fff;padding:6px;border-radius:4px;font-family:inherit;resize:vertical;';
+        notesArea.addEventListener('input', (e) => {
+            const text = e.target.value.trim();
+            if (text) profileNotes[profileId] = text;
+            else delete profileNotes[profileId];
+            saveNotes();
+        });
+
+        container.append(bookmarkBtn, notesArea);
+
+        const target = modal.querySelector('.profile-info, [data-testid="profileContent"]');
+        if (target) target.prepend(container);
+        else modal.prepend(container);
+    }
+
+    // =========================================================================
+    // 10. GOOGLE DRIVE SYNC
+    // =========================================================================
+    const GOOGLE_CLIENT_ID = 'YOUR_CLIENT_ID.apps.googleusercontent.com'; // ← your real client ID
+    const DRIVE_FILE_NAME = 'sniffies_soft_filter_backup.json';
+
+    const getAuthHeaders = () => ({
+        'Authorization': 'Bearer ' + driveToken,
+        'Content-Type': 'application/json'
+    });
+
+    const getLoginUrl = () => {
+        const redirectUri = 'https://sniffies.com'; // must be registered on your OAuth client
+        const scope = 'https://www.googleapis.com/auth/drive.appdata';
+        return 'https://accounts.google.com/o/oauth2/v2/auth?client_id=' + GOOGLE_CLIENT_ID +
+            '&redirect_uri=' + encodeURIComponent(redirectUri) +
+            '&response_type=token&scope=' + encodeURIComponent(scope);
+    };
+
+    function setSyncStatus(text) {
+        const el = document.getElementById('snp-sync-status');
+        if (el) el.textContent = text;
+    }
+
+    async function getOrCreateDriveFile() {
+        if (!driveToken) return null;
+        try {
+            const searchRes = await fetch('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name=\'' + DRIVE_FILE_NAME + '\'', { headers: getAuthHeaders() });
+            const searchData = await searchRes.json();
+            if (searchData.files && searchData.files.length > 0) return searchData.files[0].id;
+            const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+                method: 'POST',
+                headers: getAuthHeaders(),
+                body: JSON.stringify({ name: DRIVE_FILE_NAME, parents: ['appDataFolder'] })
+            });
+            const createData = await createRes.json();
+            return createData.id;
+        } catch (err) {
+            console.error('[GreaseSniff] Drive API error:', err);
+            return null;
+        }
+    }
+
+    async function syncToDrive() {
+        if (!driveToken) { setSyncStatus('Paste a token first ❌'); return; }
+        setSyncStatus('Syncing up... ⏳');
+        const fileId = await getOrCreateDriveFile();
+        if (!fileId) { setSyncStatus('Error: Not authenticated ❌'); return; }
+        const payload = {
+            appState, profileNotes, bookmarkedProfiles, hiddenProfiles,
+            chatHistory: Object.fromEntries(chatHistory),
+            savedAt: Date.now()
+        };
+        try {
+            const res = await fetch('https://www.googleapis.com/upload/drive/v3/files/' + fileId + '?uploadType=media', {
+                method: 'PATCH',
+                headers: getAuthHeaders(),
+                body: JSON.stringify(payload)
+            });
+            setSyncStatus(res.ok ? 'Backed up successfully! ✅' : 'Upload failed (' + res.status + ') ❌');
+        } catch (err) {
+            setSyncStatus('Upload failed ❌');
+        }
+    }
+
+    async function syncFromDrive() {
+        if (!driveToken) { setSyncStatus('Paste a token first ❌'); return; }
+        setSyncStatus('Downloading... ⏳');
+        const fileId = await getOrCreateDriveFile();
+        if (!fileId) { setSyncStatus('Error: Not authenticated ❌'); return; }
+        try {
+            const res = await fetch('https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media', { headers: getAuthHeaders() });
+            if (res.status === 200) {
+                const data = await res.json();
+                appState = { ...appState, ...(data.appState || {}) };
+                profileNotes = { ...profileNotes, ...(data.profileNotes || {}) };
+                bookmarkedProfiles = { ...bookmarkedProfiles, ...(data.bookmarkedProfiles || {}) };
+                hiddenProfiles = { ...hiddenProfiles, ...(data.hiddenProfiles || {}) };
+                if (data.chatHistory) {
+                    Object.entries(data.chatHistory).forEach(([id, t]) => {
+                        const time = Number(t) || 0;
+                        if (time > (chatHistory.get(String(id)) || 0)) chatHistory.set(String(id), time);
+                    });
+                    chatDirty = true;
+                }
+                saveState(); saveNotes(); saveBookmarks(); saveHidden();
+                syncControlsFromState();
+                renderCRM();
+                scheduleFilter();
+                setSyncStatus('Restored successfully! ✅');
+            } else if (res.status === 401) {
+                setSyncStatus('Token expired — get a new one ❌');
+            } else {
+                setSyncStatus('Restore failed (' + res.status + ') ❌');
+            }
+        } catch (err) {
+            setSyncStatus('Download failed ❌');
+        }
+    }
+
+    function bindSyncControls() {
+        const tokenInput = document.getElementById('snp-drive-token-input');
+        if (tokenInput) {
+            tokenInput.value = driveToken || '';
+            tokenInput.onchange = (e) => {
+                driveToken = e.target.value.trim();
+                GM_setValue(KEY_TOKEN, driveToken);
+                setSyncStatus('Token saved.');
+            };
+        }
+        const authBtn = document.getElementById('snp-auth-btn');
+        if (authBtn) authBtn.onclick = () => {
+            window.open(getLoginUrl(), '_blank', 'width=500,height=600');
+            setSyncStatus('Log in, copy the token from the popup URL bar, paste it above.');
+        };
+        const up = document.getElementById('snp-sync-up');
+        if (up) up.onclick = syncToDrive;
+        const down = document.getElementById('snp-sync-down');
+        if (down) down.onclick = syncFromDrive;
+    }
+
+    // =========================================================================
+    // 11. BOOTSTRAP
+    // =========================================================================
+    function startFilterObserver() {
+        new MutationObserver(scheduleFilter).observe(document.body, { childList: true, subtree: true });
+    }
+
+    function persistChats() {
+        if (chatDirty) {
+            chatDirty = false;
+            GM_setValue(KEY_CHATS, Object.fromEntries(chatHistory));
+        }
+    }
+
+    function init() {
+        injectStyles();
+        injectDashboard();
+        observeProfileModals();
+        startFilterObserver();
+
+        setInterval(() => { applyFilters(); maintainUI(); updateLiveStats(); }, 2000);
+        setInterval(() => {
+            trimMap(profileCache, 5000);
+            trimMap(chatHistory, 5000);
+            persistChats();
+        }, 30000);
+        window.addEventListener('pagehide', persistChats);
+
+        log('v2.3 loaded.');
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init, { once: true });
+    } else {
+        init();
+    }
+
+    // OAuth token capture (runs last so all bindings above exist)
+    if (window.location.hash.includes('access_token=')) {
+        try {
+            const params = new URLSearchParams(window.location.hash.substring(1));
+            const token = params.get('access_token');
+            if (token) {
+                driveToken = token;
+                GM_setValue(KEY_TOKEN, token);
+                history.replaceState(null, '', window.location.pathname + window.location.search);
+                alert('GreaseSniff: Google Drive token captured! You can close the popup tab.');
+            }
+        } catch (err) {
+            console.error('[GreaseSniff] token capture failed:', err);
+        }
+    }
+
+})();
