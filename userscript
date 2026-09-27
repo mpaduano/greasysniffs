@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         GreaseSniff
+// @name         GreaseySniffs
 // @namespace    https://sniffies.com/
-// @version      2.4.0
-// @description  Advanced filtering, CRM, chat badges, and quick phrases for Sniffies.
+// @version      3.0
+// @description  Filtering, CRM, chat badges and quick phrases for Sniffies. Transport-agnostic + self-diagnosing.
 // @match        https://sniffies.com/*
 // @match        https://*.sniffies.com/*
 // @run-at       document-start
@@ -15,46 +15,32 @@
 (function () {
     'use strict';
 
-    // First beacon: if this does NOT appear in the console, the file has a
-    // syntax error or Tampermonkey isn't injecting at all.
-    console.log('[GreaseSniff] v2.4 evaluating...');
-
-    // =========================================================================
-    // 0. PAGE WINDOW + DEBUG
-    // =========================================================================
+    const VERSION = '2.5.0';
     const pageWin = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-    const DEBUG = false; // ← set true to log intercepted URLs + WebSocket payloads
+    const DEBUG = false;
 
-    const log = (...a) => console.log('[GreaseSniff]', ...a);
-    const warn = (...a) => console.warn('[GreaseSniff]', ...a);
+    const log = (...a) => console.log('[GreaseySniffs]', ...a);
+    const warn = (...a) => console.warn('[GreaseySniffs]', ...a);
 
-    // Duplicate-version guard: two enabled copies cause chaos (double-patched
-    // fetch/WebSocket, fighting UI). If flagged, this copy stands down.
-    if (pageWin.__GREASESNIFF_ACTIVE__) {
-        console.error('[GreaseSniff] DUPLICATE: another GreaseSniff version is already running. ' +
-            'Disable older copies in the Tampermonkey dashboard, then reload this tab.');
-        const bannerWhenReady = () => showFatalBanner(
-            'Duplicate GreaseSniff detected — disable older versions in Tampermonkey, then reload.');
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', bannerWhenReady, { once: true });
-        } else {
-            bannerWhenReady();
-        }
+    if (pageWin.__GreaseySniffs_ACTIVE__) {
+        console.error('[GreaseySniffs] Another copy is already running. Disable older copies and reload.');
+        const banner = () => showBanner('Duplicate GreaseySniffs detected - disable older versions, then reload.');
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', banner, { once: true });
+        else banner();
         return;
     }
-    pageWin.__GREASESNIFF_ACTIVE__ = true;
+    pageWin.__GreaseySniffs_ACTIVE__ = true;
 
-    // =========================================================================
-    // 1. STORAGE & STATE
-    // =========================================================================
-    const KEY_STATE = 'sniffiesSoftFilterState_v2';
-    const KEY_NOTES = 'sniffiesSoftFilterNotes_v1';
-    const KEY_BOOKMARKS = 'sniffiesSoftFilterBookmarks_v1';
-    const KEY_HIDDEN = 'sniffiesHiddenProfiles_v1';
-    const KEY_CHATS = 'sniffiesChatHistory_v1';
-    const KEY_TOKEN = 'snp_drive_token';
+    const KEY = {
+        state: 'sniffiesSoftFilterState_v2',
+        notes: 'sniffiesSoftFilterNotes_v1',
+        bookmarks: 'sniffiesSoftFilterBookmarks_v1',
+        hidden: 'sniffiesHiddenProfiles_v1',
+        chats: 'sniffiesChatHistory_v1',
+        token: 'snp_drive_token'
+    };
 
-    const DEFAULT_STATE = {
+    const DEFAULTS = {
         enabled: true,
         hideBottom: true, hideVersBottom: true, hideSide: false,
         hideVers: false, hideVersTop: false, hideTop: false,
@@ -68,1063 +54,918 @@
         introMessages: ['Howdy', 'Hey there', "How's your night going?", "What's up?", 'Want to chat?'].join('\n')
     };
 
-    let appState = { ...DEFAULT_STATE, ...(GM_getValue(KEY_STATE, {}) || {}) };
-    const saveState = () => GM_setValue(KEY_STATE, appState);
+    const gmGet = (k, d) => { try { return GM_getValue(k, d); } catch (e) { return d; } };
+    const gmSet = (k, v) => { try { GM_setValue(k, v); } catch (e) { warn('storage write failed', e); } };
 
-    let profileNotes = GM_getValue(KEY_NOTES, {}) || {};
-    let bookmarkedProfiles = GM_getValue(KEY_BOOKMARKS, {}) || {};
-    let hiddenProfiles = GM_getValue(KEY_HIDDEN, {}) || {};
-    const saveNotes = () => GM_setValue(KEY_NOTES, profileNotes);
-    const saveBookmarks = () => GM_setValue(KEY_BOOKMARKS, bookmarkedProfiles);
-    const saveHidden = () => GM_setValue(KEY_HIDDEN, hiddenProfiles);
+    let appState = Object.assign({}, DEFAULTS, gmGet(KEY.state, {}) || {});
+    let profileNotes = gmGet(KEY.notes, {}) || {};
+    let bookmarkedProfiles = gmGet(KEY.bookmarks, {}) || {};
+    let hiddenProfiles = gmGet(KEY.hidden, {}) || {};
+    let driveToken = gmGet(KEY.token, null);
 
-    let driveToken = GM_getValue(KEY_TOKEN, null);
+    const saveState = () => gmSet(KEY.state, appState);
+    const saveNotes = () => gmSet(KEY.notes, profileNotes);
+    const saveBookmarks = () => gmSet(KEY.bookmarks, bookmarkedProfiles);
+    const saveHidden = () => gmSet(KEY.hidden, hiddenProfiles);
 
-    // =========================================================================
-    // 2. CACHES
-    // =========================================================================
     const profileCache = new Map();
-    let chatHistory = new Map(Object.entries(GM_getValue(KEY_CHATS, {}) || {}));
+    const chatHistory = new Map();
     let chatDirty = false;
+    const markerIds = new WeakMap();
+    let lastTarget = null;
+    const stats = { fetch: 0, xhr: 0, ws: 0, users: 0, chats: 0, lastUrl: '' };
 
-    const trimMap = (map, max) => { while (map.size > max) map.delete(map.keys().next().value); };
+    function trimMap(map, max) { let n = 0; for (const k of map.keys()) { if (++n > max) map.delete(k); } }
 
-    // =========================================================================
-    // 3. HELPERS
-    // =========================================================================
-    function showFatalBanner(msg) {
-        if (!document.body) return;
-        if (document.getElementById('snp-fatal-banner')) return;
-        const banner = document.createElement('div');
-        banner.id = 'snp-fatal-banner';
-        banner.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;' +
-            'background:#c0392b;color:#fff;padding:10px 16px;border-radius:0 0 8px 8px;font:12px system-ui,sans-serif;' +
-            'max-width:80vw;box-shadow:0 4px 12px rgba(0,0,0,0.5);cursor:pointer;';
-        banner.textContent = msg;
-        banner.title = 'Click to dismiss';
-        banner.onclick = () => banner.remove();
-        document.body.appendChild(banner);
+    function showBanner(msg) {
+        const go = () => {
+            if (!document.body || document.getElementById('gs-banner')) return;
+            const b = document.createElement('div');
+            b.id = 'gs-banner';
+            b.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483647;' +
+                'background:#c0392b;color:#fff;padding:10px 16px;border-radius:0 0 8px 8px;' +
+                'font:12px system-ui,sans-serif;max-width:80vw;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.5)';
+            b.textContent = msg;
+            b.onclick = () => b.remove();
+            document.body.appendChild(b);
+        };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go, { once: true });
+        else go();
     }
 
-    function normalizeTs(v) {
-        if (typeof v === 'number') return v > 1e12 ? v : v * 1000;
-        if (typeof v === 'string') { const p = Date.parse(v); if (!Number.isNaN(p)) return p; }
-        return Date.now();
-    }
+    const isEl = (n) => !!n && n.nodeType === 1;
 
-    function getMarkerId(el) {
-        if (!el) return '';
-        let id = el.id
-            || el.dataset?.userId
-            || el.dataset?.profileId
-            || el.getAttribute?.('data-user-id')
-            || el.getAttribute?.('data-id')
-            || '';
-        if (!id) {
-            const link = el.querySelector?.('a[href*="/profile/"]');
-            if (link) {
-                const m = (link.getAttribute('href') || '').match(/\/profile\/([^/?#]+)/);
-                if (m) id = m[1];
-            }
+    function parseTs(v) {
+        if (typeof v === 'number' && isFinite(v)) return v > 1e12 ? v : v * 1000;
+        if (typeof v === 'string' && v) {
+            if (/^\d{10,13}$/.test(v)) { const n = Number(v); return n > 1e12 ? n : n * 1000; }
+            const p = Date.parse(v);
+            if (!Number.isNaN(p)) return p;
         }
-        return id ? String(id) : '';
+        return null;
     }
 
     function matchTerms(text, termsString) {
         if (!termsString || !text) return false;
-        const terms = String(termsString).split('\n').map(t => t.trim().toLowerCase()).filter(Boolean);
-        return terms.some(t => text.includes(t));
+        const hay = String(text).toLowerCase();
+        return String(termsString).split(/\r?\n/).map(t => t.trim().toLowerCase()).filter(Boolean)
+            .some(t => hay.includes(t));
     }
 
-    // --- Role classification (token-based) --------------------------------
-    // Normalizes "Dom Top (Breeder)", "domTopBreeder", "dom_top_breeder" etc.
-    // into the word set {dom, top, breeder}, then classifies by WORDS.
     function normalizeRole(raw) {
         if (raw == null) return '';
         let s;
-        if (typeof raw === 'object') {
-            s = Object.values(raw).map(v => (typeof v === 'string' ? v : '')).join(' ');
-        } else {
-            s = String(raw);
-        }
-        return s
-            .replace(/([a-z])([A-Z])/g, '$1 $2')
-            .replace(/[_\-]+/g, ' ')
-            .replace(/[(){}\[\]]/g, ' ')
-            .toLowerCase()
-            .trim();
+        if (Array.isArray(raw)) s = raw.filter(v => typeof v === 'string').join(' ');
+        else if (typeof raw === 'object') s = Object.values(raw).filter(v => typeof v === 'string').join(' ');
+        else s = String(raw);
+        return s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_\-.]+/g, ' ')
+            .replace(/[(){}\[\],/]/g, ' ').toLowerCase().replace(/\s+/g, ' ').trim();
     }
 
     function classifyRole(rawRole) {
         const role = normalizeRole(rawRole);
-        const t = new Set(role.split(/\s+/).filter(Boolean));
+        const t = new Set(role.split(' ').filter(Boolean));
         return {
             role,
-            isVers:    t.has('vers') || t.has('versatile'),
-            isBottom:  t.has('bottom'),
-            isTop:     t.has('top'),
-            isSide:    t.has('side'),
-            isSub:     t.has('sub') || t.has('submissive'),
-            isDom:     t.has('dom') || t.has('dominant'),
-            isPower:   t.has('power'),
+            numeric: /^\d+$/.test(role),
+            isVers: t.has('vers') || t.has('versatile'),
+            isBottom: t.has('bottom'),
+            isTop: t.has('top'),
+            isSide: t.has('side'),
+            isSub: t.has('sub') || t.has('submissive'),
+            isDom: t.has('dom') || t.has('domme') || t.has('dominant'),
+            isPower: t.has('power'),
             isPassive: t.has('passive'),
             isBreeder: t.has('breeder')
         };
     }
 
-    // =========================================================================
-    // 4. FILTER SCHEDULING
-    // =========================================================================
-    let filterQueued = false;
+    const ID_KEYS = ['userId', 'user_id', 'profileId', 'profile_id', 'uid', 'id', '_id'];
+    const NAME_KEYS = ['name', 'userName', 'username', 'displayName', 'display_name', 'nickname', 'nick', 'handle'];
+    const ROLE_KEYS = ['attitude', 'attitudes', 'role', 'roles', 'position', 'attitudeName', 'userAttitude', 'sexualAttitude'];
+    const DESC_KEYS = ['description', 'about', 'bio', 'aboutMe', 'about_me', 'tagline', 'interests', 'bioText'];
+    const BODY_KEYS = ['message', 'body', 'text', 'content', 'msg', 'messageText'];
+    const TS_KEYS = ['createdAt', 'created_at', 'timestamp', 'sentAt', 'sent_at', 'time', 'date', 'updatedAt'];
+
+    const looksLikeId = (v) => typeof v === 'string' && v.length >= 3 && v.length <= 64 && /^[A-Za-z0-9_.:@-]+$/.test(v);
+
+    function pick(obj, keys) {
+        for (const k of keys) { const v = obj[k]; if (v != null && typeof v !== 'object') return v; }
+        return undefined;
+    }
+
+    function cacheUser(rec) {
+        const id = String(rec.id);
+        const prev = profileCache.get(id) || {};
+        profileCache.set(id, {
+            name: rec.name != null ? String(rec.name) : (prev.name || ''),
+            role: rec.role != null ? rec.role : (prev.role || ''),
+            roleKnown: rec.roleKnown || !!prev.roleKnown,
+            desc: rec.desc != null ? String(rec.desc) : (prev.desc || '')
+        });
+        stats.users++;
+    }
+
+    function isMessageish(o) {
+        return BODY_KEYS.some(k => typeof o[k] === 'string' && o[k].length) &&
+            ID_KEYS.some(k => o[k] != null && typeof o[k] !== 'object');
+    }
+
+    function walk(node, depth, budget) {
+        if (!node || typeof node !== 'object' || depth > 10) return;
+        if (budget.n-- <= 0) return;
+        if (Array.isArray(node)) { for (const n of node) walk(n, depth + 1, budget); return; }
+
+        const senderId = node.senderId ?? node.sender_id ??
+            (node.sender && typeof node.sender === 'object' ? node.sender.id : node.sender);
+
+        if (senderId != null && looksLikeId(String(senderId)) && isMessageish(node)) {
+            let t = null;
+            for (const k of TS_KEYS) { t = parseTs(node[k]); if (t) break; }
+            if (t) {
+                const id = String(senderId);
+                if (t > (chatHistory.get(id) || 0)) { chatHistory.set(id, t); chatDirty = true; stats.chats++; }
+            }
+        }
+
+        if (!isMessageish(node)) {
+            const idRaw = pick(node, ID_KEYS);
+            const name = pick(node, NAME_KEYS);
+            let role, roleKnown = false;
+            for (const k of ROLE_KEYS) {
+                if (node[k] != null && typeof node[k] !== 'object') { role = node[k]; roleKnown = true; break; }
+            }
+            const desc = pick(node, DESC_KEYS);
+            if (idRaw != null && looksLikeId(String(idRaw)) &&
+                (name !== undefined || roleKnown || (typeof desc === 'string' && desc))) {
+                cacheUser({ id: idRaw, name, role, roleKnown, desc });
+            }
+        }
+
+        for (const k in node) { const v = node[k]; if (v && typeof v === 'object') walk(v, depth + 1, budget); }
+    }
+
+    function ingest(text, url, source) {
+        if (typeof text !== 'string' || !text || text.length > 4e6) return;
+        const c = text.charCodeAt(0);
+        if (c !== 123 && c !== 91) return;
+        let data;
+        try { data = JSON.parse(text); } catch (e) { return; }
+        stats[source] = (stats[source] || 0) + 1;
+        stats.lastUrl = url || '';
+        const before = chatHistory.size;
+        walk(data, 0, { n: 30000 });
+        if (chatHistory.size !== before) scheduleFilter();
+        if (DEBUG) log(source, url, 'users:', profileCache.size, 'chats:', chatHistory.size);
+    }
+
+    function readBody(xhr, url) {
+        try {
+            if (xhr.responseType && xhr.responseType !== 'text') return;
+            if (xhr.responseText) ingest(xhr.responseText, url, 'xhr');
+        } catch (e) { }
+    }
+
+    function installTransports() {
+        try {
+            const orig = pageWin.fetch;
+            if (typeof orig === 'function' && !orig.__gs) {
+                const hooked = function (input) {
+                    const p = orig.apply(this, arguments);
+                    try {
+                        const url = (typeof input === 'string') ? input : (input && input.url) || '';
+                        p.then((res) => { try { res.clone().text().then(t => ingest(t, url, 'fetch')); } catch (e) { } })
+                            .catch(() => { });
+                    } catch (e) { }
+                    return p;
+                };
+                hooked.__gs = true;
+                pageWin.fetch = hooked;
+            }
+        } catch (e) { console.error('[GreaseySniffs] fetch hook failed', e); }
+
+        try {
+            const proto = pageWin.XMLHttpRequest && pageWin.XMLHttpRequest.prototype;
+            if (proto && !proto.open.__gs) {
+                const open = proto.open;
+                const pOpen = function (method, url) { try { this.__gsUrl = String(url); } catch (e) { } return open.apply(this, arguments); };
+                pOpen.__gs = true;
+                proto.open = pOpen;
+                const send = proto.send;
+                const pSend = function () {
+                    try { this.addEventListener('load', () => readBody(this, this.__gsUrl), { once: true }); } catch (e) { }
+                    return send.apply(this, arguments);
+                };
+                pSend.__gs = true;
+                proto.send = pSend;
+            }
+        } catch (e) { console.error('[GreaseySniffs] XHR hook failed', e); }
+
+        try {
+            const Native = pageWin.WebSocket;
+            if (typeof Native === 'function' && !Native.__gs) {
+                function Patched(url, protocols) {
+                    const ws = (protocols === undefined) ? new Native(url) : new Native(url, protocols);
+                    try { ws.__gsUrl = String(url); } catch (e) { }
+                    ws.addEventListener('message', (ev) => { if (typeof ev.data === 'string') ingest(ev.data, ws.__gsUrl, 'ws'); });
+                    return ws;
+                }
+                Patched.prototype = Native.prototype;
+                ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => { try { Patched[k] = Native[k]; } catch (e) { } });
+                Patched.__gs = true;
+                pageWin.WebSocket = Patched;
+            }
+        } catch (e) { console.error('[GreaseySniffs] WebSocket hook failed', e); }
+
+        log('transports installed (fetch/XHR/WebSocket).');
+    }
+
+    const MARKER_SEL = [
+        '[data-testid="markerUserContainer"]',
+        '.maplibregl-marker',
+        '.chat-list-item',
+        '[class*="marker"]',
+        '[class*="chat-item"]'
+    ].join(',');
+
+    const ID_ATTR = /^(data-.*(user|profile|owner|member|account).*(id|uid)|data-userid|data-uid|data-id|data-key)$/i;
+    const UUIDISH = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+    function candidatesFor(el) {
+        const out = [];
+        const push = (v) => { if (v != null && looksLikeId(String(v)) && out.indexOf(String(v)) === -1) out.push(String(v)); };
+        try {
+            for (const a of el.attributes) {
+                if (ID_ATTR.test(a.name)) push(a.value);
+                else if (/^data-/.test(a.name) && /(user|profile|owner|member|uid)/i.test(a.name)) push(a.value);
+            }
+            if (el.id && !/^maplibre|^marker-\d|^:r/i.test(el.id)) push(el.id);
+            const link = el.querySelector('a[href*="/profile/"]');
+            if (link) { const m = (link.getAttribute('href') || '').match(/\/profile\/([^/?#]+)/); if (m) push(m[1]); }
+            const img = el.querySelector('img[src]');
+            if (img) {
+                const src = img.getAttribute('src') || '';
+                const u = src.match(/[?&](?:userId|user_id|profileId|profile_id|id)=([^&#]+)/i);
+                if (u) push(decodeURIComponent(u[1]));
+                const g = src.match(UUIDISH); if (g) push(g[0]);
+                src.split('/').forEach(seg => { if (/^[A-Za-z0-9_-]{16,64}$/.test(seg)) push(seg); });
+            }
+        } catch (e) { }
+        return out;
+    }
+
+    function resolveId(el) {
+        if (!isEl(el)) return '';
+        let rec = markerIds.get(el);
+        if (!rec) { rec = { id: '', candidates: candidatesFor(el) }; markerIds.set(el, rec); }
+        if (rec.candidates.length === 1) return rec.candidates[0];
+        if (rec.candidates.length > 1) {
+            if (profileCache.size) {
+                const hit = rec.candidates.find(c => profileCache.has(c));
+                if (hit) { rec.id = hit; return hit; }
+            }
+            if (!rec.id) rec.id = rec.candidates[0];
+            return rec.id;
+        }
+        return '';
+    }
+
+    function markerName(id) {
+        const p = profileCache.get(id);
+        return p && p.name ? p.name : ('#' + String(id).slice(0, 6));
+    }
+
+    let filterQueued = false, applying = false, mutations = 0;
+
     function scheduleFilter() {
         if (filterQueued) return;
         filterQueued = true;
         requestAnimationFrame(() => { filterQueued = false; applyFilters(); });
     }
 
-    // =========================================================================
-    // 5. NETWORK INTERCEPTORS — installed in try/catch so a failure here can
-    //    never again kill the UI, filters, or right-click (the v2.3 failure).
-    // =========================================================================
-    function installInterceptors() {
-        // ---- fetch ----
-        try {
-            const originalFetch = pageWin.fetch;
-            const hookedFetch = async function (...args) {
-                const response = await originalFetch.apply(this, args);
-                try {
-                    const input = args[0];
-                    const url = (typeof input === 'string') ? input : (input && input.url) || '';
-                    if (DEBUG && url) log('fetch →', url);
-
-                    if (url.includes('/api/v1/users/partial') || url.includes('/api/v1/users/search')) {
-                        response.clone().json().then((data) => {
-                            const users = Array.isArray(data) ? data : (data?.users || data?.data || []);
-                            if (!Array.isArray(users)) return;
-                            users.forEach((u) => {
-                                if (u && u.id) {
-                                    profileCache.set(String(u.id), {
-                                        name: String(u.name ?? ''),
-                                        role: u.role ?? u.attitude ?? '', // raw; classifyRole handles format
-                                        description: String(u.description ?? u.about ?? '').toLowerCase()
-                                    });
-                                }
-                            });
-                            if (DEBUG) log('profiles cached:', profileCache.size);
-                            scheduleFilter();
-                        }).catch(() => {});
-                    }
-
-                    if (/chat/i.test(url)) {
-                        response.clone().json().then((data) => {
-                            const before = chatHistory.size;
-                            scanForChats(data, 0);
-                            if (chatHistory.size !== before) {
-                                chatDirty = true;
-                                if (DEBUG) log('chat cache seeded from', url, '→', chatHistory.size);
-                                scheduleFilter();
-                            }
-                        }).catch(() => {});
-                    }
-                } catch (err) {
-                    console.error('[GreaseSniff] fetch hook error:', err);
-                }
-                return response;
-            };
-            pageWin.fetch = hookedFetch;
-            log('fetch interceptor installed.');
-        } catch (err) {
-            console.error('[GreaseSniff] FAILED to install fetch interceptor:', err);
-        }
-
-        // ---- WebSocket ----
-        try {
-            const NativeWebSocket = pageWin.WebSocket;
-            function PatchedWebSocket(url, protocols) {
-                const ws = (protocols === undefined) ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
-                ws.addEventListener('message', (event) => {
-                    try {
-                        if (typeof event.data !== 'string' || event.data.length > 1000000) return;
-                        const c = event.data.charCodeAt(0);
-                        if (c !== 123 && c !== 91) return;
-                        const data = JSON.parse(event.data);
-                        if (DEBUG && (PatchedWebSocket._n || 0) < 25) {
-                            PatchedWebSocket._n = (PatchedWebSocket._n || 0) + 1;
-                            log('ws ←', event.data.slice(0, 300));
-                        }
-                        const before = chatHistory.size;
-                        scanForChats(data, 0);
-                        if (chatHistory.size !== before) {
-                            chatDirty = true;
-                            scheduleFilter();
-                        }
-                    } catch (e) { /* not JSON */ }
-                });
-                return ws;
-            }
-            PatchedWebSocket.prototype = NativeWebSocket.prototype;
-            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach((k) => {
-                try { PatchedWebSocket[k] = NativeWebSocket[k]; } catch (e) { /* ignore */ }
-            });
-            pageWin.WebSocket = PatchedWebSocket;
-            log('WebSocket interceptor installed.');
-        } catch (err) {
-            console.error('[GreaseSniff] FAILED to install WebSocket interceptor:', err);
-        }
-    }
-
-    function scanForChats(node, depth) {
-        if (!node || typeof node !== 'object' || depth > 8) return;
-        if (Array.isArray(node)) { node.forEach(n => scanForChats(n, depth + 1)); return; }
-
-        let senderId = node.senderId ?? node.sender_id ?? node.userId ?? node.user_id;
-        if (senderId == null && node.sender != null) {
-            senderId = (typeof node.sender === 'object') ? node.sender.id : node.sender;
-        }
-        const kind = String(node.type ?? node.event ?? node.action ?? '').toLowerCase();
-        const looksLikeMessage =
-            node.message != null || node.body != null ||
-            node.text != null || node.content != null;
-
-        if (senderId != null && (looksLikeMessage || kind.includes('chat') || kind.includes('message'))) {
-            const id = String(senderId);
-            const t = normalizeTs(node.createdAt ?? node.created_at ?? node.timestamp ?? node.sentAt ?? node.sent_at);
-            if (t > (chatHistory.get(id) || 0)) chatHistory.set(id, t);
-        }
-        for (const key of Object.keys(node)) scanForChats(node[key], depth + 1);
-    }
-
-    installInterceptors(); // still top-level/document-start, but now failure-isolated
-
-    // =========================================================================
-    // 6. FILTER ENGINE
-    // =========================================================================
-    let warnedEmptyChats = false;
-    let warnedEmptyProfiles = false;
-
     function applyFilters() {
         if (!document.body) return;
-        const markers = document.querySelectorAll('[data-testid="markerUserContainer"], .chat-list-item');
-
-        // Direct diagnostic for "filter doesn't work": markers exist but we
-        // captured no profiles → the fetch interceptor isn't seeing data.
-        if (markers.length > 0 && profileCache.size === 0 && !warnedEmptyProfiles) {
-            warnedEmptyProfiles = true;
-            warn('Markers found but 0 profiles captured. The fetch interceptor is not seeing API data. ' +
-                'Check the P: counter on the launcher; set DEBUG = true and send me the fetch → lines.');
-        }
-
-        const now = Date.now();
-        const dayMs = 86400000;
-        markers.forEach((m) => {
-            try { filterOne(m, now, dayMs); }
-            catch (err) { console.error('[GreaseSniff] filter error:', err); }
-        });
+        applying = true;
+        try {
+            const markers = document.querySelectorAll(MARKER_SEL);
+            const now = Date.now(), day = 86400000;
+            for (let i = 0; i < markers.length; i++) filterOne(markers[i], now, day);
+        } finally { applying = false; }
     }
 
-    function filterOne(marker, now, dayMs) {
-        const profileId = getMarkerId(marker);
-        if (!profileId) return;
+    function filterOne(marker, now, day) {
+        const id = resolveId(marker);
+        if (!id) return;
+        if (!appState.enabled) { marker.classList.remove('gs-hide', 'gs-ring'); removeBadge(marker); return; }
 
-        if (!appState.enabled) {
-            marker.classList.remove('sniffies-soft-hide');
-            marker.style.boxShadow = '';
-            marker.style.borderRadius = '';
-            const b = marker.querySelector('.sniffies-chat-age-badge');
-            if (b) b.remove();
-            return;
+        let hide = !!hiddenProfiles[id], ring = false;
+
+        const p = profileCache.get(id);
+        if (!hide && p) {
+            const c = classifyRole(p.role);
+            const known = p.roleKnown && !c.numeric;
+            if (known) {
+                if (appState.hideSubBottom && c.isBottom && c.isSub) hide = true;
+                if (appState.hidePowerBottom && c.isBottom && c.isPower) hide = true;
+                if (appState.hidePassiveTop && c.isTop && c.isPassive) hide = true;
+                if (appState.hideDomTopBreeder && c.isTop && c.isDom && c.isBreeder) hide = true;
+
+                if (!hide && appState.hideBottom && c.isBottom && !c.isVers) hide = true;
+                if (!hide && appState.hideVersBottom && c.isVers && c.isBottom) hide = true;
+                if (!hide && appState.hideSide && c.isSide) hide = true;
+                if (!hide && appState.hideTop && c.isTop && !c.isVers) hide = true;
+                if (!hide && appState.hideVersTop && c.isVers && c.isTop) hide = true;
+                if (!hide && appState.hideVers && c.isVers && !c.isBottom && !c.isTop) hide = true;
+                if (!hide && appState.hideUnspecified && !c.isBottom && !c.isTop && !c.isVers && !c.isSide) hide = true;
+            }
+            const hay = ((p.name || '') + ' ' + (p.desc || '')).toLowerCase();
+            if (!hide && appState.excludeProfileTermsEnabled && matchTerms(hay, appState.excludeProfileTerms)) hide = true;
+            if (!hide && appState.includeProfileTermsEnabled && matchTerms(hay, appState.includeProfileTerms)) ring = true;
         }
 
-        let hide = !!hiddenProfiles[profileId]; // right-click Hide Profile — always wins
-        let highlight = false;
-
-        const profile = profileCache.get(profileId);
-        if (!hide && profile) {
-            const c = classifyRole(profile.role);
-            const desc = String(profile.description || '');
-
-            // Subcategory toggles: hide ONLY that subcategory
-            if (appState.hideSubBottom && c.isBottom && c.isSub) hide = true;
-            if (appState.hidePowerBottom && c.isBottom && c.isPower) hide = true;
-            if (appState.hidePassiveTop && c.isTop && c.isPassive) hide = true;
-            if (appState.hideDomTopBreeder && c.isTop && c.isDom && c.isBreeder) hide = true;
-
-            // Broad categories: include their subcategories
-            if (!hide && appState.hideBottom && c.isBottom && !c.isVers) hide = true;
-            if (!hide && appState.hideVersBottom && c.isVers && c.isBottom) hide = true;
-            if (!hide && appState.hideSide && c.isSide) hide = true;
-            if (!hide && appState.hideTop && c.isTop && !c.isVers) hide = true;
-            if (!hide && appState.hideVersTop && c.isVers && c.isTop) hide = true;
-            if (!hide && appState.hideVers && c.isVers && !c.isBottom && !c.isTop) hide = true;
-            if (!hide && appState.hideUnspecified &&
-                !c.isBottom && !c.isTop && !c.isVers && !c.isSide) hide = true;
-
-            if (!hide && appState.excludeProfileTermsEnabled && desc) {
-                if (matchTerms(desc, appState.excludeProfileTerms)) hide = true;
-            }
-            if (!hide && appState.includeProfileTermsEnabled && desc) {
-                if (matchTerms(desc, appState.includeProfileTerms)) highlight = true;
-            }
-        }
-
-        const lastChat = chatHistory.get(profileId);
-        if (!hide && lastChat) {
+        const last = chatHistory.get(id);
+        if (!hide && last) {
             if (appState.hideAnyChats) hide = true;
-            else if (appState.hideRecentChats24h && (now - lastChat) < dayMs) hide = true;
+            else if (appState.hideRecentChats24h && (now - last) < day) hide = true;
         }
-        if (!hide && appState.showOnlyChats && !lastChat && chatHistory.size > 0) hide = true;
-        if (appState.showOnlyChats && chatHistory.size === 0 && !warnedEmptyChats) {
-            warnedEmptyChats = true;
-            warn('"Show only chatted" is ON but no chat data captured yet. Open the Chats page once, then re-check.');
-        }
+        if (!hide && appState.showOnlyChats && chatHistory.size && !last) hide = true;
 
-        if (hide) {
-            marker.classList.add('sniffies-soft-hide');
-            marker.style.boxShadow = '';
-            const b = marker.querySelector('.sniffies-chat-age-badge');
-            if (b) b.remove();
-            return;
-        }
+        if (hide) { marker.classList.add('gs-hide'); marker.classList.remove('gs-ring'); removeBadge(marker); return; }
 
-        marker.classList.remove('sniffies-soft-hide');
-
-        if (highlight) {
-            marker.style.boxShadow = '0 0 0 3px rgba(255, 214, 10, 0.9)';
-            marker.style.borderRadius = '9999px';
-        } else {
-            marker.style.boxShadow = '';
-            marker.style.borderRadius = '';
-        }
-
-        if (appState.showChatAges && lastChat) {
-            let badge = marker.querySelector('.sniffies-chat-age-badge');
-            if (!badge) {
-                badge = document.createElement('div');
-                badge.className = 'sniffies-chat-age-badge';
-                badge.style.cssText = 'position:absolute;top:-10px;right:-10px;background:rgba(9,16,28,0.92);' +
-                    'color:#78d6ff;padding:2px 6px;border-radius:10px;font-size:10px;font-family:system-ui,sans-serif;' +
-                    'pointer-events:none;z-index:100;';
-                marker.appendChild(badge);
-            }
-            const hrs = Math.floor((now - lastChat) / 3600000);
-            badge.textContent = hrs < 1 ? '<1h' : hrs + 'h';
-        } else {
-            const b = marker.querySelector('.sniffies-chat-age-badge');
-            if (b) b.remove();
-        }
+        marker.classList.remove('gs-hide');
+        marker.classList.toggle('gs-ring', ring);
+        updateBadge(marker, last, now);
     }
 
-    // =========================================================================
-    // 7. RIGHT-CLICK CONTEXT MENU + QUICK PHRASES
-    // =========================================================================
-    let contextMenu = null;
-    let phraseMenu = null;
+    function removeBadge(marker) { const b = marker.querySelector(':scope > .gs-badge'); if (b) b.remove(); }
 
-    function closeContextMenu() { if (contextMenu) { contextMenu.remove(); contextMenu = null; } }
-    function closePhraseMenu() { if (phraseMenu) { phraseMenu.remove(); phraseMenu = null; } }
+    function updateBadge(marker, last, now) {
+        let b = marker.querySelector(':scope > .gs-badge');
+        if (!appState.showChatAges || !last) { if (b) b.remove(); return; }
+        if (!b) { b = document.createElement('div'); b.className = 'gs-badge'; marker.appendChild(b); }
+        const h = Math.floor((now - last) / 3600000);
+        const txt = h < 1 ? '<1h' : h < 48 ? h + 'h' : Math.floor(h / 24) + 'd';
+        if (b.textContent !== txt) b.textContent = txt;
+    }
 
-    function showContextMenu(x, y, profileId) {
-        closeContextMenu();
+    let ctxMenu = null, phraseMenu = null;
+    const closeCtx = () => { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } };
+    const closePhrase = () => { if (phraseMenu) { phraseMenu.remove(); phraseMenu = null; } };
 
-        const menu = document.createElement('div');
-        menu.id = 'snp-context-menu';
+    function place(el, x, y) {
+        el.style.left = Math.max(8, Math.min(x, window.innerWidth - el.offsetWidth - 10)) + 'px';
+        el.style.top = Math.max(8, Math.min(y, window.innerHeight - el.offsetHeight - 10)) + 'px';
+    }
 
-        const phraseBtn = document.createElement('button');
-        phraseBtn.className = 'snp-context-btn';
-        phraseBtn.textContent = '💬 Send Quick Phrase';
-        phraseBtn.addEventListener('click', () => {
-            closeContextMenu();
-            showPhraseMenu(x, y);
+    function showCtx(x, y, id) {
+        closeCtx();
+        const m = document.createElement('div');
+        m.className = 'gs-menu';
+        const who = document.createElement('div');
+        who.className = 'gs-menu-title';
+        who.textContent = markerName(id);
+        m.appendChild(who);
+        const b1 = document.createElement('button');
+        b1.className = 'gs-btn'; b1.textContent = 'Quick Phrase';
+        b1.onclick = () => { closeCtx(); showPhrase(x, y); };
+        m.appendChild(b1);
+        const b2 = document.createElement('button');
+        b2.className = 'gs-btn'; b2.textContent = 'Bookmark / Note';
+        b2.onclick = () => { closeCtx(); openCRM(id); };
+        m.appendChild(b2);
+        const isHidden = !!hiddenProfiles[id];
+        const b3 = document.createElement('button');
+        b3.className = 'gs-btn danger';
+        b3.textContent = isHidden ? 'Unhide Profile' : 'Hide Profile';
+        b3.onclick = () => {
+            if (isHidden) delete hiddenProfiles[id]; else hiddenProfiles[id] = { added: Date.now() };
+            saveHidden(); closeCtx(); scheduleFilter(); renderCRM();
+        };
+        m.appendChild(b3);
+        document.body.appendChild(m);
+        place(m, x, y);
+        ctxMenu = m;
+    }
+
+    function showPhrase(x, y) {
+        closePhrase();
+        const m = document.createElement('div');
+        m.className = 'gs-menu';
+        const t = document.createElement('div');
+        t.className = 'gs-menu-title';
+        t.textContent = 'Quick Phrases' + (lastTarget ? ' to ' + markerName(lastTarget.id) : '');
+        m.appendChild(t);
+        const list = String(appState.introMessages || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+        if (!list.length) {
+            const e = document.createElement('div');
+            e.className = 'gs-menu-title'; e.textContent = 'None set - add them in the dashboard.';
+            m.appendChild(e);
+        }
+        list.forEach(p => {
+            const b = document.createElement('button');
+            b.className = 'gs-btn'; b.textContent = p;
+            b.onclick = () => { closePhrase(); sendPhrase(p); };
+            m.appendChild(b);
         });
+        document.body.appendChild(m);
+        place(m, x, y);
+        phraseMenu = m;
+    }
 
-        const isHidden = !!hiddenProfiles[profileId];
-        const hideBtn = document.createElement('button');
-        hideBtn.className = 'snp-context-btn danger';
-        hideBtn.textContent = isHidden ? '👁 Unhide Profile' : '🚫 Hide Profile';
-        hideBtn.addEventListener('click', () => {
-            try {
-                if (isHidden) delete hiddenProfiles[profileId];
-                else hiddenProfiles[profileId] = { added: Date.now() };
-                saveHidden();
-                applyFilters();
-                scheduleFilter();
-            } catch (err) {
-                console.error('[GreaseSniff] hide toggle failed:', err);
-            }
-            closeContextMenu();
-        });
+    function findComposer() {
+        const sels = ['textarea[placeholder*="message" i]', 'input[placeholder*="message" i]',
+            'textarea[placeholder*="say" i]', '[contenteditable="true"][role="textbox"]',
+            '.chat-input textarea', 'form textarea', 'textarea'];
+        for (const s of sels) { const el = document.querySelector(s); if (el && el.offsetParent !== null) return el; }
+        return null;
+    }
 
-        menu.append(phraseBtn, hideBtn);
-        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 180)) + 'px';
-        menu.style.top = Math.max(8, Math.min(y, window.innerHeight - 110)) + 'px';
-        document.body.appendChild(menu);
-        contextMenu = menu;
+    function setNativeValue(el, text) {
+        if (el.isContentEditable) {
+            el.textContent = text;
+            el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+            return;
+        }
+        const proto = el.tagName === 'TEXTAREA' ? pageWin.HTMLTextAreaElement.prototype : pageWin.HTMLInputElement.prototype;
+        const d = Object.getOwnPropertyDescriptor(proto, 'value');
+        const setter = d && d.set;
+        if (setter) setter.call(el, text); else el.value = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function sendPhrase(text) {
+        const input = findComposer();
+        if (!input) { warn('Chat input not found - open the conversation first.'); showBanner('Open a conversation first.'); return; }
+        setNativeValue(input, text);
+        try { input.focus(); } catch (e) { }
+        setTimeout(() => {
+            const btn = document.querySelector('button[aria-label*="send" i], button[title*="send" i], form button[type="submit"]');
+            if (btn && !btn.disabled) { btn.click(); return; }
+            ['keydown', 'keypress', 'keyup'].forEach(type => {
+                input.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            });
+        }, 300);
     }
 
     document.addEventListener('contextmenu', (e) => {
         try {
-            if (!(e.target instanceof Element)) return;
-            const marker = e.target.closest('[data-testid="markerUserContainer"], .chat-list-item');
-            if (!marker) return;
-            const profileId = getMarkerId(marker);
-            if (!profileId) {
-                warn('Right-clicked a marker but could not read its profile ID.');
-                return;
-            }
+            if (!isEl(e.target)) return;
+            const m = e.target.closest(MARKER_SEL);
+            if (!m) return;
+            const id = resolveId(m);
+            if (!id) { warn('Right-clicked a marker with no resolvable id.'); return; }
             e.preventDefault();
-            showContextMenu(e.clientX, e.clientY, profileId);
-        } catch (err) {
-            console.error('[GreaseSniff] contextmenu handler error:', err);
-        }
-    });
+            showCtx(e.clientX, e.clientY, id);
+        } catch (err) { console.error('[GreaseySniffs] contextmenu', err); }
+    }, true);
 
     document.addEventListener('click', (e) => {
-        const t = (e.target instanceof Element) ? e.target : null;
-        if (contextMenu && (!t || !contextMenu.contains(t))) closeContextMenu();
-        if (phraseMenu && (!t || !phraseMenu.contains(t))) closePhraseMenu();
-    });
-    window.addEventListener('scroll', () => { closeContextMenu(); closePhraseMenu(); }, { passive: true });
-
-    function sendPhrase(text) {
-        const input = document.querySelector('textarea[placeholder*="message" i], input[placeholder*="message" i]');
-        if (!input) { warn('Chat input not found — open the conversation first.'); return; }
-
-        const proto = (input.tagName === 'TEXTAREA')
-            ? window.HTMLTextAreaElement.prototype
-            : window.HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        if (setter) setter.call(input, text);
-        else input.value = text;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-
-        const sendBtn = document.querySelector('button[aria-label*="send" i], button[title*="send" i]');
-        if (sendBtn) setTimeout(() => sendBtn.click(), 250);
-        else input.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
-        }));
-    }
-
-    function showPhraseMenu(x, y) {
-        closePhraseMenu();
-        const menu = document.createElement('div');
-        menu.id = 'snp-phrase-menu';
-        menu.style.cssText = 'position:fixed;z-index:1000001;background:rgba(12,18,30,0.98);' +
-            'border:1px solid rgba(255,255,255,0.2);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.6);' +
-            'padding:8px;display:flex;flex-direction:column;gap:6px;min-width:200px;font:13px system-ui,sans-serif;';
-
-        const title = document.createElement('div');
-        title.textContent = '💬 Quick Phrases';
-        title.style.cssText = 'font-size:11px;color:#8ea0ba;font-weight:bold;';
-        menu.appendChild(title);
-
-        const phrases = String(appState.introMessages || '').split('\n').map(p => p.trim()).filter(Boolean);
-        if (phrases.length === 0) {
-            const empty = document.createElement('div');
-            empty.style.cssText = 'font-size:11px;color:#8ea0ba;';
-            empty.textContent = 'No phrases set — add them in the dashboard.';
-            menu.appendChild(empty);
+        const t = isEl(e.target) ? e.target : null;
+        if (ctxMenu && (!t || !ctxMenu.contains(t))) closeCtx();
+        if (phraseMenu && (!t || !phraseMenu.contains(t))) closePhrase();
+        if (t && t.closest) {
+            const m = t.closest(MARKER_SEL);
+            if (m) { const id = resolveId(m); if (id) lastTarget = { id, t: Date.now() }; }
         }
-        phrases.forEach((p) => {
-            const btn = document.createElement('button');
-            btn.className = 'snp-context-btn';
-            btn.textContent = p;
-            btn.addEventListener('click', () => { sendPhrase(p); closePhraseMenu(); });
-            menu.appendChild(btn);
-        });
+    }, true);
 
-        document.body.appendChild(menu);
-        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 240)) + 'px';
-        menu.style.top = Math.max(8, Math.min(y, window.innerHeight - (menu.offsetHeight || 200) - 10)) + 'px';
-        phraseMenu = menu;
-    }
-    // NOTE: phrases are typed into whatever conversation is currently OPEN —
-    // a Sniffies limitation, not a bug here.
-
-    // =========================================================================
-    // 8. STYLES + MAIN DASHBOARD
-    // =========================================================================
-    function injectStyles() {
-        if (document.getElementById('snp-global-style')) return;
-        const style = document.createElement('style');
-        style.id = 'snp-global-style';
-        style.textContent = `
-            #snp-context-menu, #snp-phrase-menu {
-                background: rgba(15, 20, 30, 0.97);
-                border: 1px solid rgba(255,255,255,0.15);
-                border-radius: 8px;
-                box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-                padding: 6px;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-                min-width: 160px;
-                font: 13px system-ui, sans-serif;
-            }
-            .snp-context-btn {
-                background: transparent; border: none; color: #eef4ff;
-                text-align: left; padding: 8px 12px; border-radius: 4px;
-                cursor: pointer; transition: background 0.15s ease;
-            }
-            .snp-context-btn:hover { background: rgba(255,255,255,0.1); }
-            .snp-context-btn.danger:hover { background: rgba(255,85,85,0.2); color: #ff7575; }
-            .sniffies-soft-hide { display: none !important; }
-            .snp-tab { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent;
-                       color: #8ea0ba; padding: 10px; cursor: pointer; font-weight: bold; }
-            .snp-tab.active { color: #67d1ff; border-bottom-color: #67d1ff; background: rgba(255,255,255,0.05); }
-            .snp-tab:hover:not(.active) { color: #fff; background: rgba(255,255,255,0.02); }
-            .snp-crm-item { background: rgba(255,255,255,0.05); padding: 8px; border-radius: 6px;
-                            border: 1px solid rgba(255,255,255,0.1); }
-            .snp-crm-item a { color: #67d1ff; text-decoration: none; font-weight: bold; }
-            .snp-crm-item a:hover { text-decoration: underline; }
-        `;
-        document.head.appendChild(style);
-    }
+    ['scroll', 'wheel', 'resize', 'blur'].forEach(ev =>
+        window.addEventListener(ev, () => { closeCtx(); closePhrase(); }, { passive: true }));
 
     const CHECKBOXES = [
-        ['snp-opt-enabled', 'enabled'],
-        ['snp-opt-hideBottom', 'hideBottom'],
-        ['snp-opt-hideVersBottom', 'hideVersBottom'],
-        ['snp-opt-hideSide', 'hideSide'],
-        ['snp-opt-hideVers', 'hideVers'],
-        ['snp-opt-hideVersTop', 'hideVersTop'],
-        ['snp-opt-hideTop', 'hideTop'],
-        ['snp-opt-hideUnspecified', 'hideUnspecified'],
-        ['snp-opt-hideSubBottom', 'hideSubBottom'],
-        ['snp-opt-hidePowerBottom', 'hidePowerBottom'],
-        ['snp-opt-hidePassiveTop', 'hidePassiveTop'],
-        ['snp-opt-hideDomTopBreeder', 'hideDomTopBreeder'],
-        ['snp-opt-showChatAges', 'showChatAges'],
-        ['snp-opt-hideRecentChats24h', 'hideRecentChats24h'],
-        ['snp-opt-hideAnyChats', 'hideAnyChats'],
-        ['snp-opt-showOnlyChats', 'showOnlyChats'],
-        ['snp-opt-excludeProfileTermsEnabled', 'excludeProfileTermsEnabled'],
-        ['snp-opt-includeProfileTermsEnabled', 'includeProfileTermsEnabled']
+        ['gs-enabled', 'enabled'],
+        ['gs-hideBottom', 'hideBottom'], ['gs-hideVersBottom', 'hideVersBottom'],
+        ['gs-hideSide', 'hideSide'], ['gs-hideVers', 'hideVers'],
+        ['gs-hideVersTop', 'hideVersTop'], ['gs-hideTop', 'hideTop'],
+        ['gs-hideUnspecified', 'hideUnspecified'],
+        ['gs-hideSubBottom', 'hideSubBottom'], ['gs-hidePowerBottom', 'hidePowerBottom'],
+        ['gs-hidePassiveTop', 'hidePassiveTop'], ['gs-hideDomTopBreeder', 'hideDomTopBreeder'],
+        ['gs-showChatAges', 'showChatAges'],
+        ['gs-hideRecentChats24h', 'hideRecentChats24h'], ['gs-hideAnyChats', 'hideAnyChats'],
+        ['gs-showOnlyChats', 'showOnlyChats'],
+        ['gs-exEnabled', 'excludeProfileTermsEnabled'], ['gs-inEnabled', 'includeProfileTermsEnabled']
     ];
-    const TEXTAREAS = [
-        ['snp-opt-excludeProfileTerms', 'excludeProfileTerms'],
-        ['snp-opt-includeProfileTerms', 'includeProfileTerms'],
-        ['snp-opt-introMessages', 'introMessages']
-    ];
+    const TEXTAREAS = [['gs-exTerms', 'excludeProfileTerms'], ['gs-inTerms', 'includeProfileTerms'], ['gs-phrases', 'introMessages']];
+    const INLINE = 'background:rgba(0,0,0,.3);color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:4px;width:100%;';
 
-    function switchTab(targetId) {
-        const dash = document.getElementById('snp-main-dashboard');
-        if (!dash) return;
-        dash.querySelectorAll('.snp-tab').forEach(t => t.classList.toggle('active', t.dataset.target === targetId));
-        dash.querySelectorAll('.snp-tab-content').forEach(c => { c.style.display = (c.id === targetId) ? 'block' : 'none'; });
+    function injectStyles() {
+        if (document.getElementById('gs-style')) return;
+        const s = document.createElement('style');
+        s.id = 'gs-style';
+        s.textContent =
+            '.gs-hide{display:none !important}' +
+            '.gs-ring{box-shadow:0 0 0 3px rgba(255,214,10,.92) !important;border-radius:9999px !important}' +
+            '.gs-badge{position:absolute;top:-9px;right:-9px;background:rgba(9,16,28,.93);color:#78d6ff;' +
+            'padding:1px 6px;border-radius:10px;font:10px system-ui,sans-serif;pointer-events:none;z-index:60}' +
+            '.gs-menu{position:fixed;z-index:1000001;background:rgba(15,20,30,.98);border:1px solid rgba(255,255,255,.18);' +
+            'border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.6);padding:6px;display:flex;flex-direction:column;' +
+            'gap:4px;min-width:170px;max-width:280px;font:13px system-ui,sans-serif}' +
+            '.gs-btn{background:transparent;border:0;color:#eef4ff;text-align:left;padding:7px 10px;border-radius:4px;' +
+            'cursor:pointer;font:inherit}' +
+            '.gs-btn:hover{background:rgba(255,255,255,.1)}' +
+            '.gs-btn.danger:hover{background:rgba(255,85,85,.2);color:#ff7575}' +
+            '.gs-menu-title{font-size:11px;color:#8ea0ba;font-weight:bold;padding:2px 10px 4px;overflow:hidden;' +
+            'text-overflow:ellipsis;white-space:nowrap}' +
+            '.gs-tab{flex:1;background:transparent;border:0;border-bottom:2px solid transparent;color:#8ea0ba;' +
+            'padding:9px 4px;cursor:pointer;font-weight:bold;font-size:12px}' +
+            '.gs-tab.active{color:#67d1ff;border-bottom-color:#67d1ff;background:rgba(255,255,255,.05)}' +
+            '.gs-card{background:rgba(255,255,255,.05);padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,.1)}' +
+            '.gs-card a{color:#67d1ff;text-decoration:none;font-weight:bold}' +
+            '.gs-card a:hover{text-decoration:underline}' +
+            '.gs-row{display:flex;justify-content:space-between;align-items:center;gap:6px}' +
+            '.gs-mono{font:10px ui-monospace,Menlo,Consolas,monospace;color:#8ea0ba;word-break:break-all;' +
+            'white-space:pre-wrap;max-height:190px;overflow:auto;background:rgba(0,0,0,.35);padding:6px;border-radius:4px}' +
+            '.gs-btn2{background:#2a3550;color:#fff;border:0;padding:5px 9px;border-radius:4px;cursor:pointer;font-size:11px}';
+        (document.head || document.documentElement).appendChild(s);
+    }
+
+    function switchTab(target) {
+        const d = document.getElementById('gs-dash');
+        if (!d) return;
+        d.querySelectorAll('.gs-tab').forEach(t => t.classList.toggle('active', t.dataset.target === target));
+        d.querySelectorAll('.gs-panel').forEach(p => { p.style.display = p.id === target ? 'block' : 'none'; });
     }
 
     function bindControls() {
-        CHECKBOXES.forEach(([id, key]) => {
-            const el = document.getElementById(id);
-            if (!el) return;
-            el.checked = !!appState[key];
-            el.onchange = (e) => { appState[key] = e.target.checked; saveState(); scheduleFilter(); };
+        CHECKBOXES.forEach(pair => {
+            const el = document.getElementById(pair[0]); if (!el) return;
+            el.checked = !!appState[pair[1]];
+            el.onchange = (e) => { appState[pair[1]] = e.target.checked; saveState(); scheduleFilter(); };
         });
-        TEXTAREAS.forEach(([id, key]) => {
-            const el = document.getElementById(id);
-            if (!el) return;
-            el.value = appState[key] ?? '';
-            el.addEventListener('input', (e) => { appState[key] = e.target.value; saveState(); });
+        TEXTAREAS.forEach(pair => {
+            const el = document.getElementById(pair[0]); if (!el) return;
+            el.value = appState[pair[1]] == null ? '' : appState[pair[1]];
+            el.addEventListener('input', (e) => { appState[pair[1]] = e.target.value; saveState(); });
         });
     }
 
-    function syncControlsFromState() {
-        CHECKBOXES.forEach(([id, key]) => {
-            const el = document.getElementById(id);
-            if (el) el.checked = !!appState[key];
-        });
-        TEXTAREAS.forEach(([id, key]) => {
-            const el = document.getElementById(id);
-            if (el) el.value = appState[key] ?? '';
-        });
+    function syncControls() {
+        CHECKBOXES.forEach(pair => { const el = document.getElementById(pair[0]); if (el) el.checked = !!appState[pair[1]]; });
+        TEXTAREAS.forEach(pair => { const el = document.getElementById(pair[0]); if (el) el.value = appState[pair[1]] == null ? '' : appState[pair[1]]; });
     }
 
-    function updateLiveStats() {
-        const statsEl = document.getElementById('snp-live-stats');
-        if (statsEl) statsEl.textContent = 'Profiles captured: ' + profileCache.size +
-            ' · Chat history: ' + chatHistory.size + ' people';
-
-        const rolesEl = document.getElementById('snp-roles-seen');
-        if (rolesEl) {
-            const counts = new Map();
-            profileCache.forEach((p) => {
-                const r = normalizeRole(p.role) || '(empty)';
-                counts.set(r, (counts.get(r) || 0) + 1);
-            });
-            const lines = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
-                .map(([r, n]) => '"' + r + '" x' + n);
-            rolesEl.textContent = lines.length
-                ? 'Roles seen: ' + lines.join(' · ')
-                : 'Roles seen: none yet (browse the map to load profiles).';
+    function updateStats() {
+        const l = document.getElementById('gs-launcher');
+        if (l) {
+            const txt = 'GS U' + profileCache.size + ' C' + chatHistory.size;
+            if (l.textContent !== txt) l.textContent = txt;
         }
+        const s = document.getElementById('gs-stats');
+        if (!s) return;
+        const markers = document.querySelectorAll(MARKER_SEL);
+        let resolved = 0;
+        for (let i = 0; i < markers.length; i++) if (resolveId(markers[i])) resolved++;
+        s.innerHTML = 'v' + VERSION + ' | markers <b>' + markers.length + '</b> | resolved <b>' + resolved +
+            '</b> | users <b>' + profileCache.size + '</b> | chatted <b>' + chatHistory.size + '</b><br>' +
+            'payloads fetch:' + stats.fetch + ' xhr:' + stats.xhr + ' ws:' + stats.ws + ' | mutations:' + mutations +
+            (resolved === 0 && markers.length ? '<br><span style="color:#ff7575">No marker ids resolved - see Diagnose tab.</span>' : '');
 
-        // At-a-glance health on the launcher itself (no console needed)
-        const launcherEl = document.getElementById('snp-dashboard-launcher');
-        if (launcherEl) {
-            launcherEl.textContent = '⚙️ GS · P:' + profileCache.size + ' · C:' + chatHistory.size;
-            launcherEl.title = 'P = profiles captured · C = chatted-with captured. ' +
-                'P should climb while you browse the map; C climbs after you open the Chats page.';
+        const dg = document.getElementById('gs-diag');
+        if (dg) {
+            const roles = new Map();
+            profileCache.forEach(p => { const r = normalizeRole(p.role) || '(none)'; roles.set(r, (roles.get(r) || 0) + 1); });
+            const top = [...roles.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(e => e[0] + ' x' + e[1]).join('\n') || '(none yet)';
+            const m0 = markers[0];
+            dg.textContent =
+                'Transports  fetch=' + stats.fetch + '  xhr=' + stats.xhr + '  ws=' + stats.ws + '\n' +
+                'Users parsed=' + stats.users + '   chat events=' + stats.chats + '\n' +
+                'Last payload URL: ' + (stats.lastUrl || '(none)') + '\n\n' +
+                'Roles seen:\n' + top + '\n\n' +
+                'Marker id candidates (first marker):\n' +
+                (m0 ? JSON.stringify(candidatesFor(m0)) : '(no markers on screen)') + '\n\n' +
+                'First marker HTML:\n' + (m0 ? m0.outerHTML.slice(0, 900) : '(none)');
         }
     }
 
     function renderCRM() {
-        const list = document.getElementById('snp-crm-list');
+        const list = document.getElementById('gs-crm');
         if (list) {
             list.textContent = '';
             const ids = new Set([...Object.keys(bookmarkedProfiles), ...Object.keys(profileNotes)]);
-            if (ids.size === 0) {
-                const empty = document.createElement('div');
-                empty.style.cssText = 'color:#8ea0ba;text-align:center;padding:10px;';
-                empty.textContent = 'No bookmarks or notes yet.';
-                list.appendChild(empty);
-            } else {
-                ids.forEach((id) => {
-                    const item = document.createElement('div');
-                    item.className = 'snp-crm-item';
-                    const row = document.createElement('div');
-                    row.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:4px;';
-                    const link = document.createElement('a');
-                    link.href = '/profile/' + id;
-                    link.target = '_blank';
-                    link.textContent = 'Profile ' + String(id).substring(0, 8) + '…';
-                    const icon = document.createElement('span');
-                    icon.textContent = bookmarkedProfiles[id] ? '⭐' : '📝';
-                    row.append(link, icon);
-                    item.appendChild(row);
-                    const note = profileNotes[id];
-                    if (note) {
-                        const noteDiv = document.createElement('div');
-                        noteDiv.style.cssText = 'color:#a9b8cc;font-style:italic;';
-                        noteDiv.textContent = '"' + note + '"';
-                        item.appendChild(noteDiv);
-                    }
-                    list.appendChild(item);
-                });
-            }
+            if (!ids.size) list.innerHTML = '<div style="color:#8ea0ba;text-align:center;padding:10px">No bookmarks or notes yet.</div>';
+            ids.forEach(id => {
+                const c = document.createElement('div'); c.className = 'gs-card';
+                const row = document.createElement('div'); row.className = 'gs-row';
+                const a = document.createElement('a');
+                a.href = 'https://sniffies.com/profile/' + encodeURIComponent(id);
+                a.target = '_blank'; a.rel = 'noopener';
+                a.textContent = markerName(id);
+                const ic = document.createElement('span');
+                ic.textContent = bookmarkedProfiles[id] ? '⭐' : '📝';
+                row.appendChild(a); row.appendChild(ic);
+                c.appendChild(row);
+                if (profileNotes[id]) {
+                    const n = document.createElement('div');
+                    n.style.cssText = 'color:#a9b8cc;font-style:italic';
+                    n.textContent = '"' + profileNotes[id] + '"';
+                    c.appendChild(n);
+                }
+                list.appendChild(c);
+            });
         }
-
-        const hiddenList = document.getElementById('snp-hidden-list');
-        if (hiddenList) {
-            hiddenList.textContent = '';
-            const hiddenIds = Object.keys(hiddenProfiles);
-            const header = document.createElement('div');
-            header.style.cssText = 'color:#8ea0ba;font-weight:bold;';
-            header.textContent = 'Hidden profiles (' + hiddenIds.length + ')';
-            hiddenList.appendChild(header);
-            if (hiddenIds.length === 0) {
-                const none = document.createElement('div');
-                none.style.cssText = 'color:#5c6c84;';
-                none.textContent = 'None — right-click a marker to hide one.';
-                hiddenList.appendChild(none);
+        const hl = document.getElementById('gs-hidden');
+        if (hl) {
+            hl.textContent = '';
+            const ids = Object.keys(hiddenProfiles);
+            const h = document.createElement('div');
+            h.style.cssText = 'color:#8ea0ba;font-weight:bold';
+            h.textContent = 'Hidden profiles (' + ids.length + ')';
+            hl.appendChild(h);
+            if (!ids.length) {
+                const n = document.createElement('div');
+                n.style.color = '#5c6c84';
+                n.textContent = 'None - right-click a marker.';
+                hl.appendChild(n);
             }
-            hiddenIds.forEach((id) => {
-                const row = document.createElement('div');
-                row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:6px;';
-                const label = document.createElement('span');
-                label.textContent = String(id).substring(0, 8) + '…';
-                const btn = document.createElement('button');
-                btn.textContent = 'Unhide';
-                btn.style.cssText = 'background:rgba(255,255,255,0.1);color:#fff;border:none;padding:2px 8px;' +
-                    'border-radius:4px;cursor:pointer;font-size:11px;';
-                btn.addEventListener('click', () => {
-                    delete hiddenProfiles[id];
-                    saveHidden();
-                    renderCRM();
-                    scheduleFilter();
-                });
-                row.append(label, btn);
-                hiddenList.appendChild(row);
+            ids.forEach(id => {
+                const row = document.createElement('div'); row.className = 'gs-row';
+                const s = document.createElement('span'); s.textContent = markerName(id);
+                const b = document.createElement('button'); b.className = 'gs-btn2'; b.textContent = 'Unhide';
+                b.onclick = () => { delete hiddenProfiles[id]; saveHidden(); renderCRM(); scheduleFilter(); };
+                row.appendChild(s); row.appendChild(b); hl.appendChild(row);
             });
         }
     }
 
-    function injectDashboard() {
-        document.getElementById('snp-dashboard-launcher')?.remove();
-        document.getElementById('snp-main-dashboard')?.remove();
-
-        const launcher = document.createElement('button');
-        launcher.id = 'snp-dashboard-launcher';
-        launcher.textContent = '⚙️ GS';
-        launcher.style.cssText = 'position:fixed;bottom:20px;left:20px;z-index:999999;background:rgba(15,20,30,0.95);' +
-            'color:#eef4ff;border:1px solid rgba(255,255,255,0.2);border-radius:20px;padding:8px 16px;' +
-            'font:bold 12px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.5);';
-        launcher.onmouseover = () => { launcher.style.background = 'rgba(30,42,64,0.95)'; };
-        launcher.onmouseout = () => { launcher.style.background = 'rgba(15,20,30,0.95)'; };
-
-        const dashboard = document.createElement('div');
-        dashboard.id = 'snp-main-dashboard';
-        dashboard.style.cssText = 'position:fixed;bottom:60px;left:20px;z-index:1000000;background:rgba(12,18,30,0.98);' +
-            'color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,0.7);' +
-            'width:340px;max-height:70vh;display:none;flex-direction:column;font:13px system-ui,sans-serif;overflow:hidden;';
-
-        dashboard.innerHTML = `
-            <div style="display:flex;justify-content:space-between;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);">
-                <strong style="font-size:14px;">GreaseSniff v2.4</strong>
-                <button id="snp-dash-close" style="background:none;border:none;color:#fff;cursor:pointer;font-weight:bold;">✕</button>
-            </div>
-            <div id="snp-tab-bar" style="display:flex;border-bottom:1px solid rgba(255,255,255,0.1);">
-                <button class="snp-tab active" data-target="snp-tab-filters">Filters</button>
-                <button class="snp-tab" data-target="snp-tab-phrases">Phrases</button>
-                <button class="snp-tab" data-target="snp-tab-crm">CRM</button>
-                <button class="snp-tab" data-target="snp-tab-sync">Sync</button>
-            </div>
-            <div id="snp-tab-panels" style="padding:16px;overflow-y:auto;flex:1;">
-                <div id="snp-tab-filters" class="snp-tab-content">
-                    <div id="snp-live-stats" style="font-size:11px;color:#8ea0ba;margin-bottom:4px;"></div>
-                    <div id="snp-roles-seen" style="font-size:10px;color:#6d7f99;margin-bottom:10px;word-break:break-word;"></div>
-                    <label style="display:flex;gap:8px;margin-bottom:12px;font-weight:bold;color:#67d1ff;">
-                        <input type="checkbox" id="snp-opt-enabled"> Master Enable Filter
-                    </label>
-                    <div style="margin-bottom:12px;">
-                        <strong>Attitude Filters (Hide)</strong>
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;font-size:12px;">
-                            <label><input type="checkbox" id="snp-opt-hideBottom"> Bottom</label>
-                            <label><input type="checkbox" id="snp-opt-hideVersBottom"> Vers Bottom</label>
-                            <label><input type="checkbox" id="snp-opt-hideSide"> Side</label>
-                            <label><input type="checkbox" id="snp-opt-hideVers"> Vers</label>
-                            <label><input type="checkbox" id="snp-opt-hideVersTop"> Vers Top</label>
-                            <label><input type="checkbox" id="snp-opt-hideTop"> Top</label>
-                            <label><input type="checkbox" id="snp-opt-hideUnspecified"> Unspecified</label>
-                        </div>
-                        <div style="font-size:10px;color:#8ea0ba;margin-top:6px;">Broad toggles include subcategories (Top covers Dom Top (Breeder), Passive Top, etc.)</div>
-                        <div style="margin-top:8px;padding-left:10px;border-left:2px solid rgba(255,255,255,0.08);display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;color:#b8c6db;">
-                            <label><input type="checkbox" id="snp-opt-hideSubBottom"> Sub Bottom</label>
-                            <label><input type="checkbox" id="snp-opt-hidePowerBottom"> Power Bottom</label>
-                            <label><input type="checkbox" id="snp-opt-hidePassiveTop"> Passive Top</label>
-                            <label><input type="checkbox" id="snp-opt-hideDomTopBreeder"> Dom Top (Breeder)</label>
-                        </div>
-                        <div style="font-size:10px;color:#8ea0ba;margin-top:4px;">Subcategory toggles hide ONLY that type.</div>
-                    </div>
-                    <div style="margin-bottom:12px;">
-                        <strong>Chat Filters</strong>
-                        <div style="display:flex;flex-direction:column;gap:6px;margin-top:6px;font-size:12px;">
-                            <label><input type="checkbox" id="snp-opt-showChatAges"> Show Chat Age Badges</label>
-                            <label><input type="checkbox" id="snp-opt-hideRecentChats24h"> Hide Chatted (Last 24h)</label>
-                            <label><input type="checkbox" id="snp-opt-hideAnyChats"> Hide Chatted (Ever)</label>
-                            <label><input type="checkbox" id="snp-opt-showOnlyChats"> Show ONLY Chatted</label>
-                            <div style="font-size:10px;color:#8ea0ba;">Open the Chats page once per session so history can be captured.</div>
-                        </div>
-                    </div>
-                    <div style="margin-bottom:12px;">
-                        <div style="display:flex;justify-content:space-between;align-items:center;">
-                            <strong>Exclude Text (Hide if found)</strong>
-                            <label style="font-size:11px;"><input type="checkbox" id="snp-opt-excludeProfileTermsEnabled"> on</label>
-                        </div>
-                        <textarea id="snp-opt-excludeProfileTerms" style="width:100%;height:50px;background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:4px;margin-top:4px;" placeholder="One phrase per line..."></textarea>
-                    </div>
-                    <div>
-                        <div style="display:flex;justify-content:space-between;align-items:center;">
-                            <strong>Include Text (Gold Ring)</strong>
-                            <label style="font-size:11px;"><input type="checkbox" id="snp-opt-includeProfileTermsEnabled"> on</label>
-                        </div>
-                        <textarea id="snp-opt-includeProfileTerms" style="width:100%;height:50px;background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:4px;margin-top:4px;" placeholder="One phrase per line..."></textarea>
-                    </div>
-                </div>
-
-                <div id="snp-tab-phrases" class="snp-tab-content" style="display:none;">
-                    <strong>Quick Phrases</strong>
-                    <p style="font-size:11px;color:#8ea0ba;margin:4px 0 8px;">One phrase per line. They appear when you right-click a marker. Note: phrases are sent to whatever conversation is currently open.</p>
-                    <textarea id="snp-opt-introMessages" style="width:100%;height:200px;background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:4px;white-space:pre;"></textarea>
-                </div>
-
-                <div id="snp-tab-crm" class="snp-tab-content" style="display:none;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-                        <strong>Bookmarks &amp; Notes</strong>
-                        <button id="snp-refresh-crm" style="background:#ff5500;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;">Refresh</button>
-                    </div>
-                    <div id="snp-crm-list" style="display:flex;flex-direction:column;gap:8px;font-size:12px;max-height:250px;overflow-y:auto;"></div>
-                    <div style="border-top:1px solid rgba(255,255,255,0.1);margin:10px 0 6px;"></div>
-                    <div id="snp-hidden-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px;max-height:150px;overflow-y:auto;"></div>
-                </div>
-
-                <div id="snp-tab-sync" class="snp-tab-content" style="display:none;">
-                    <strong>Google Drive Backup</strong>
-                    <p style="font-size:11px;color:#8ea0ba;margin:4px 0 12px;">Sync settings, notes, bookmarks, hidden profiles, and chat history via a hidden app folder in your Drive.</p>
-                    <div style="display:flex;flex-direction:column;gap:10px;">
-                        <input type="password" id="snp-drive-token-input" placeholder="Paste OAuth Token here..." style="background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.2);padding:6px;border-radius:4px;font-size:11px;">
-                        <button id="snp-auth-btn" style="background:#4285F4;color:#fff;border:none;padding:8px;border-radius:4px;cursor:pointer;font-weight:bold;">1. Get Auth Token</button>
-                        <div style="display:flex;gap:8px;">
-                            <button id="snp-sync-up" style="flex:1;background:#0f9d58;color:#fff;border:none;padding:8px;border-radius:4px;cursor:pointer;font-weight:bold;">↑ Backup</button>
-                            <button id="snp-sync-down" style="flex:1;background:#db4437;color:#fff;border:none;padding:8px;border-radius:4px;cursor:pointer;font-weight:bold;">↓ Restore</button>
-                        </div>
-                        <div id="snp-sync-status" style="text-align:center;font-size:11px;color:#ffd250;min-height:16px;"></div>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        document.body.appendChild(launcher);
-        document.body.appendChild(dashboard);
-
-        launcher.onclick = () => {
-            const isOpen = dashboard.style.display === 'flex';
-            dashboard.style.display = isOpen ? 'none' : 'flex';
-            if (!isOpen) { renderCRM(); updateLiveStats(); }
-        };
-        document.getElementById('snp-dash-close').onclick = () => { dashboard.style.display = 'none'; };
-        document.getElementById('snp-refresh-crm').onclick = renderCRM;
-
-        dashboard.querySelectorAll('.snp-tab').forEach(tab => {
-            tab.onclick = () => switchTab(tab.dataset.target);
-        });
-
-        bindControls();
-        bindSyncControls();
-        renderCRM();
-        updateLiveStats();
-    }
-
-    function maintainUI() {
-        if (!document.getElementById('snp-dashboard-launcher') || !document.getElementById('snp-main-dashboard')) {
-            injectDashboard();
+    function openCRM(id) {
+        const dash = document.getElementById('gs-dash');
+        if (dash) dash.style.display = 'flex';
+        switchTab('gs-crm');
+        const ta = document.getElementById('gs-quicknote');
+        if (ta && id) {
+            ta.dataset.id = id;
+            ta.value = profileNotes[id] || '';
+            ta.placeholder = 'Note for ' + markerName(id) + '...';
         }
     }
 
-    // =========================================================================
-    // 9. PROFILE MODAL CRM
-    // =========================================================================
-    function observeProfileModals() {
-        new MutationObserver(() => {
-            const modal = document.querySelector('[data-testid="profileModal"], .profile-modal-container');
-            if (modal && !document.getElementById('snp-crm-container')) injectProfileCRM(modal);
-        }).observe(document.body, { childList: true, subtree: true });
-    }
+    function injectUI() {
+        const oldL = document.getElementById('gs-launcher');
+        const oldD = document.getElementById('gs-dash');
+        if (oldL && oldD) { renderCRM(); updateStats(); return; }
+        if (oldL) oldL.remove();
+        if (oldD) oldD.remove();
 
-    function injectProfileCRM(modal) {
-        const match = window.location.pathname.match(/\/profile\/([a-zA-Z0-9_-]+)/);
-        if (!match) return;
-        const profileId = match[1];
+        const l = document.createElement('button');
+        l.id = 'gs-launcher';
+        l.textContent = 'GS U0 C0';
+        l.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:999999;background:rgba(15,20,30,.95);' +
+            'color:#eef4ff;border:1px solid rgba(255,255,255,.2);border-radius:20px;padding:8px 14px;' +
+            'font:bold 12px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.5)';
 
-        const container = document.createElement('div');
-        container.id = 'snp-crm-container';
-        container.style.cssText = 'background:rgba(100,150,255,0.1);border-left:3px solid rgba(100,150,255,0.6);' +
-            'padding:10px;margin:12px 16px;border-radius:6px;display:flex;flex-direction:column;gap:8px;';
+        const d = document.createElement('div');
+        d.id = 'gs-dash';
+        d.style.cssText = 'position:fixed;bottom:58px;left:18px;z-index:1000000;background:rgba(12,18,30,.98);' +
+            'color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.7);' +
+            'width:350px;max-width:94vw;max-height:74vh;display:none;flex-direction:column;font:13px system-ui,sans-serif;overflow:hidden';
 
-        const bookmarkBtn = document.createElement('button');
-        const setBookmarkUI = (on) => {
-            bookmarkBtn.textContent = on ? '⭐ Bookmarked' : '☆ Bookmark Profile';
-            bookmarkBtn.style.background = on ? 'rgba(255,210,80,0.3)' : 'rgba(255,255,255,0.1)';
-            bookmarkBtn.style.color = on ? '#ffd250' : '#fff';
+        const box = (t) => '<div style="margin:0 0 12px"><strong>' + t + '</strong>';
+        const grid = (items) => '<div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:6px;font-size:12px">' +
+            items.map(p => '<label><input type="checkbox" id="' + p[0] + '"> ' + p[1] + '</label>').join('') + '</div>';
+        const note = (t) => '<div style="font-size:10px;color:#8ea0ba;margin-top:6px">' + t + '</div>';
+        const tabs = ['Filters|gs-p-filters', 'Phrases|gs-p-phrases', 'CRM|gs-p-crm', 'Diagnose|gs-p-diag', 'Sync|gs-p-sync']
+            .map(s => { const p = s.split('|'); return '<button class="gs-tab' + (p[1] === 'gs-p-filters' ? ' active' : '') + '" data-target="' + p[1] + '">' + p[0] + '</button>'; }).join('');
+
+        d.innerHTML =
+            '<div class="gs-row" style="padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05)">' +
+            '<strong style="font-size:14px">GreaseySniffs v' + VERSION + '</strong>' +
+            '<button id="gs-close" class="gs-btn2">✕</button></div>' +
+            '<div style="display:flex;border-bottom:1px solid rgba(255,255,255,.1)">' + tabs + '</div>' +
+            '<div style="padding:14px;overflow-y:auto;flex:1">' +
+
+            '<div id="gs-p-filters" class="gs-panel">' +
+            '<div id="gs-stats" style="font-size:11px;color:#8ea0ba;margin-bottom:10px;line-height:1.5"></div>' +
+            '<label style="display:flex;gap:8px;margin-bottom:12px;font-weight:bold;color:#67d1ff">' +
+            '<input type="checkbox" id="gs-enabled"> Master Enable</label>' +
+            box('Attitude (hide)') +
+            grid([['gs-hideBottom', 'Bottom'], ['gs-hideVersBottom', 'Vers Bottom'], ['gs-hideSide', 'Side'],
+            ['gs-hideVers', 'Vers'], ['gs-hideVersTop', 'Vers Top'], ['gs-hideTop', 'Top'],
+            ['gs-hideUnspecified', 'Unspecified']]) +
+            note('Vers has its own toggles, so the broad ones skip it.') +
+            '<div style="margin-top:8px;padding-left:10px;border-left:2px solid rgba(255,255,255,.08)">' +
+            grid([['gs-hideSubBottom', 'Sub Bottom'], ['gs-hidePowerBottom', 'Power Bottom'],
+            ['gs-hidePassiveTop', 'Passive Top'], ['gs-hideDomTopBreeder', 'Dom Top (Breeder)']]) + '</div>' +
+            note('Subcategory toggles hide only that exact type.') +
+            box('Chats') +
+            '<div style="display:flex;flex-direction:column;gap:6px;margin-top:6px;font-size:12px">' +
+            '<label><input type="checkbox" id="gs-showChatAges"> Show chat-age badges</label>' +
+            '<label><input type="checkbox" id="gs-hideRecentChats24h"> Hide chatted (last 24h)</label>' +
+            '<label><input type="checkbox" id="gs-hideAnyChats"> Hide chatted (ever)</label>' +
+            '<label><input type="checkbox" id="gs-showOnlyChats"> Show ONLY chatted</label></div>' +
+            box('Text filters (name + bio)') +
+            '<div class="gs-row"><strong style="font-size:12px">Exclude to hide</strong>' +
+            '<label style="font-size:11px"><input type="checkbox" id="gs-exEnabled"> on</label></div>' +
+            '<textarea id="gs-exTerms" style="' + INLINE + 'height:46px;margin-top:4px" placeholder="one phrase per line"></textarea>' +
+            '<div class="gs-row" style="margin-top:8px"><strong style="font-size:12px">Include to ring</strong>' +
+            '<label style="font-size:11px"><input type="checkbox" id="gs-inEnabled"> on</label></div>' +
+            '<textarea id="gs-inTerms" style="' + INLINE + 'height:46px;margin-top:4px" placeholder="one phrase per line"></textarea>' +
+            '</div>' +
+
+            '<div id="gs-p-phrases" class="gs-panel" style="display:none">' +
+            '<strong>Quick Phrases</strong>' +
+            '<p style="font-size:11px;color:#8ea0ba;margin:4px 0 8px">One per line. Shown on right-click. Sent to the conversation that is open.</p>' +
+            '<textarea id="gs-phrases" style="' + INLINE + 'height:190px"></textarea></div>' +
+
+            '<div id="gs-p-crm" class="gs-panel" style="display:none">' +
+            '<div class="gs-row" style="margin-bottom:10px"><strong>Bookmarks and Notes</strong>' +
+            '<button id="gs-refresh" class="gs-btn2">Refresh</button></div>' +
+            '<div style="font-size:11px;color:#8ea0ba;margin-bottom:6px">Quick note - use right-click, then Bookmark / Note.</div>' +
+            '<textarea id="gs-quicknote" data-id="" style="' + INLINE + 'height:52px;margin-bottom:10px" placeholder="pick a profile first..."></textarea>' +
+            '<div id="gs-crm" style="display:flex;flex-direction:column;gap:7px;font-size:12px;max-height:190px;overflow-y:auto"></div>' +
+            '<div style="border-top:1px solid rgba(255,255,255,.1);margin:10px 0 6px"></div>' +
+            '<div id="gs-hidden" style="display:flex;flex-direction:column;gap:5px;font-size:12px"></div></div>' +
+
+            '<div id="gs-p-diag" class="gs-panel" style="display:none">' +
+            '<strong>Diagnose</strong>' +
+            '<p style="font-size:11px;color:#8ea0ba;margin:4px 0 8px">If markers appear but ids do not resolve, the site markup changed. Send me these two blocks.</p>' +
+            '<div id="gs-diag" class="gs-mono"></div>' +
+            '<div style="margin-top:8px;display:flex;gap:6px">' +
+            '<button id="gs-copy" class="gs-btn2">Copy report</button>' +
+            '<button id="gs-rescan" class="gs-btn2">Re-scan</button></div></div>' +
+
+            '<div id="gs-p-sync" class="gs-panel" style="display:none">' +
+            '<strong>Google Drive backup</strong>' +
+            '<p style="font-size:11px;color:#8ea0ba;margin:4px 0 10px">Optional. Needs your own OAuth client id and a registered redirect URI.</p>' +
+            '<button id="gs-auth" class="gs-btn2" style="width:100%;margin-bottom:8px;background:#4285F4">1. Get auth token</button>' +
+            '<input type="password" id="gs-token" placeholder="Paste OAuth token" style="' + INLINE + 'padding:6px;font-size:11px">' +
+            '<div style="display:flex;gap:8px;margin-top:10px">' +
+            '<button id="gs-up" class="gs-btn2" style="flex:1;background:#0f9d58">↑ Backup</button>' +
+            '<button id="gs-down" class="gs-btn2" style="flex:1;background:#db4437">↓ Restore</button></div>' +
+            '<div id="gs-syncstat" style="text-align:center;font-size:11px;color:#ffd250;min-height:16px;margin-top:6px"></div></div>' +
+
+            '</div>';
+
+        document.body.appendChild(l);
+        document.body.appendChild(d);
+
+        l.onclick = () => {
+            const open = d.style.display === 'flex';
+            d.style.display = open ? 'none' : 'flex';
+            if (!open) { renderCRM(); updateStats(); }
         };
-        setBookmarkUI(!!bookmarkedProfiles[profileId]);
-        bookmarkBtn.style.cssText += 'align-self:flex-start;padding:4px 10px;border-radius:4px;border:none;cursor:pointer;font-weight:bold;';
-        bookmarkBtn.onclick = () => {
-            const nowOn = !bookmarkedProfiles[profileId];
-            if (nowOn) bookmarkedProfiles[profileId] = { added: Date.now() };
-            else delete bookmarkedProfiles[profileId];
-            setBookmarkUI(nowOn);
-            saveBookmarks();
+        d.querySelector('#gs-close').onclick = () => { d.style.display = 'none'; };
+        d.querySelector('#gs-refresh').onclick = () => { renderCRM(); updateStats(); };
+        d.querySelector('#gs-rescan').onclick = () => { scheduleFilter(); updateStats(); };
+        d.querySelector('#gs-copy').onclick = () => {
+            const t = 'GreaseySniffs v' + VERSION + '\n' + document.getElementById('gs-diag').textContent;
+            if (navigator.clipboard) navigator.clipboard.writeText(t).then(() => showBanner('Report copied.'));
         };
-
-        const notesArea = document.createElement('textarea');
-        notesArea.placeholder = 'Add private notes here...';
-        notesArea.value = profileNotes[profileId] || '';
-        notesArea.style.cssText = 'width:100%;min-height:60px;background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.2);' +
-            'color:#fff;padding:6px;border-radius:4px;font-family:inherit;resize:vertical;';
-        notesArea.addEventListener('input', (e) => {
-            const text = e.target.value.trim();
-            if (text) profileNotes[profileId] = text;
-            else delete profileNotes[profileId];
+        d.querySelectorAll('.gs-tab').forEach(t => { t.onclick = () => switchTab(t.dataset.target); });
+        d.querySelector('#gs-quicknote').addEventListener('input', (e) => {
+            const id = e.target.dataset.id;
+            if (!id) return;
+            const v = e.target.value.trim();
+            if (v) profileNotes[id] = v; else delete profileNotes[id];
             saveNotes();
         });
 
-        container.append(bookmarkBtn, notesArea);
-
-        const target = modal.querySelector('.profile-info, [data-testid="profileContent"]');
-        if (target) target.prepend(container);
-        else modal.prepend(container);
+        bindControls();
+        bindSync();
+        renderCRM();
+        updateStats();
     }
 
-    // =========================================================================
-    // 10. GOOGLE DRIVE SYNC
-    // =========================================================================
-    const GOOGLE_CLIENT_ID = 'YOUR_CLIENT_ID.apps.googleusercontent.com'; // ← your real client ID
-    const DRIVE_FILE_NAME = 'sniffies_soft_filter_backup.json';
+    const CLIENT_ID = 'YOUR_CLIENT_ID.apps.googleusercontent.com';
+    const FILE = 'GreaseySniffs_backup.json';
+    const authHeaders = () => ({ Authorization: 'Bearer ' + driveToken, 'Content-Type': 'application/json' });
+    const loginUrl = () => 'https://accounts.google.com/o/oauth2/v2/auth?client_id=' + CLIENT_ID +
+        '&redirect_uri=' + encodeURIComponent('https://sniffies.com/') +
+        '&response_type=token&scope=' + encodeURIComponent('https://www.googleapis.com/auth/drive.appdata');
+    const syncStatus = (t) => { const el = document.getElementById('gs-syncstat'); if (el) el.textContent = t; };
 
-    const getAuthHeaders = () => ({
-        'Authorization': 'Bearer ' + driveToken,
-        'Content-Type': 'application/json'
-    });
-
-    const getLoginUrl = () => {
-        const redirectUri = 'https://sniffies.com';
-        const scope = 'https://www.googleapis.com/auth/drive.appdata';
-        return 'https://accounts.google.com/o/oauth2/v2/auth?client_id=' + GOOGLE_CLIENT_ID +
-            '&redirect_uri=' + encodeURIComponent(redirectUri) +
-            '&response_type=token&scope=' + encodeURIComponent(scope);
-    };
-
-    function setSyncStatus(text) {
-        const el = document.getElementById('snp-sync-status');
-        if (el) el.textContent = text;
+    async function driveFileId() {
+        const r = await fetch('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D%27' + FILE + '%27', { headers: authHeaders() });
+        const j = await r.json();
+        if (j.files && j.files.length) return j.files[0].id;
+        const c = await fetch('https://www.googleapis.com/drive/v3/files', {
+            method: 'POST', headers: authHeaders(), body: JSON.stringify({ name: FILE, parents: ['appDataFolder'] })
+        });
+        const cj = await c.json();
+        return cj.id;
     }
 
-    async function getOrCreateDriveFile() {
-        if (!driveToken) return null;
+    async function backup() {
+        if (!driveToken) { syncStatus('Paste a token first'); return; }
+        syncStatus('Backing up...');
         try {
-            const searchRes = await fetch('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name=\'' + DRIVE_FILE_NAME + '\'', { headers: getAuthHeaders() });
-            const searchData = await searchRes.json();
-            if (searchData.files && searchData.files.length > 0) return searchData.files[0].id;
-            const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
-                method: 'POST',
-                headers: getAuthHeaders(),
-                body: JSON.stringify({ name: DRIVE_FILE_NAME, parents: ['appDataFolder'] })
+            const id = await driveFileId();
+            if (!id) { syncStatus('Could not open file'); return; }
+            const r = await fetch('https://www.googleapis.com/upload/drive/v3/files/' + id + '?uploadType=media', {
+                method: 'PATCH', headers: authHeaders(),
+                body: JSON.stringify({
+                    v: VERSION, appState, profileNotes, bookmarkedProfiles, hiddenProfiles,
+                    chatHistory: Object.fromEntries(chatHistory), savedAt: Date.now()
+                })
             });
-            const createData = await createRes.json();
-            return createData.id;
-        } catch (err) {
-            console.error('[GreaseSniff] Drive API error:', err);
-            return null;
-        }
+            syncStatus(r.ok ? 'Backed up' : 'Upload failed (' + r.status + ')');
+        } catch (e) { syncStatus('Upload failed'); }
     }
 
-    async function syncToDrive() {
-        if (!driveToken) { setSyncStatus('Paste a token first ❌'); return; }
-        setSyncStatus('Syncing up... ⏳');
-        const fileId = await getOrCreateDriveFile();
-        if (!fileId) { setSyncStatus('Error: Not authenticated ❌'); return; }
-        const payload = {
-            appState, profileNotes, bookmarkedProfiles, hiddenProfiles,
-            chatHistory: Object.fromEntries(chatHistory),
-            savedAt: Date.now()
-        };
+    async function restore() {
+        if (!driveToken) { syncStatus('Paste a token first'); return; }
+        syncStatus('Restoring...');
         try {
-            const res = await fetch('https://www.googleapis.com/upload/drive/v3/files/' + fileId + '?uploadType=media', {
-                method: 'PATCH',
-                headers: getAuthHeaders(),
-                body: JSON.stringify(payload)
+            const id = await driveFileId();
+            if (!id) { syncStatus('Could not open file'); return; }
+            const r = await fetch('https://www.googleapis.com/drive/v3/files/' + id + '?alt=media', { headers: authHeaders() });
+            if (!r.ok) { syncStatus('Restore failed (' + r.status + ')'); return; }
+            const d = await r.json();
+            appState = Object.assign(appState, d.appState || {});
+            profileNotes = Object.assign(profileNotes, d.profileNotes || {});
+            bookmarkedProfiles = Object.assign(bookmarkedProfiles, d.bookmarkedProfiles || {});
+            hiddenProfiles = Object.assign(hiddenProfiles, d.hiddenProfiles || {});
+            Object.entries(d.chatHistory || {}).forEach(e => {
+                const t = Number(e[1]) || 0;
+                if (t > (chatHistory.get(e[0]) || 0)) chatHistory.set(e[0], t);
             });
-            setSyncStatus(res.ok ? 'Backed up successfully! ✅' : 'Upload failed (' + res.status + ') ❌');
-        } catch (err) {
-            setSyncStatus('Upload failed ❌');
-        }
+            saveState(); saveNotes(); saveBookmarks(); saveHidden();
+            syncControls(); renderCRM(); scheduleFilter();
+            syncStatus('Restored');
+        } catch (e) { syncStatus('Download failed'); }
     }
 
-    async function syncFromDrive() {
-        if (!driveToken) { setSyncStatus('Paste a token first ❌'); return; }
-        setSyncStatus('Downloading... ⏳');
-        const fileId = await getOrCreateDriveFile();
-        if (!fileId) { setSyncStatus('Error: Not authenticated ❌'); return; }
-        try {
-            const res = await fetch('https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media', { headers: getAuthHeaders() });
-            if (res.status === 200) {
-                const data = await res.json();
-                appState = { ...appState, ...(data.appState || {}) };
-                profileNotes = { ...profileNotes, ...(data.profileNotes || {}) };
-                bookmarkedProfiles = { ...bookmarkedProfiles, ...(data.bookmarkedProfiles || {}) };
-                hiddenProfiles = { ...hiddenProfiles, ...(data.hiddenProfiles || {}) };
-                if (data.chatHistory) {
-                    Object.entries(data.chatHistory).forEach(([id, t]) => {
-                        const time = Number(t) || 0;
-                        if (time > (chatHistory.get(String(id)) || 0)) chatHistory.set(String(id), time);
-                    });
-                    chatDirty = true;
-                }
-                saveState(); saveNotes(); saveBookmarks(); saveHidden();
-                syncControlsFromState();
-                renderCRM();
-                scheduleFilter();
-                setSyncStatus('Restored successfully! ✅');
-            } else if (res.status === 401) {
-                setSyncStatus('Token expired — get a new one ❌');
-            } else {
-                setSyncStatus('Restore failed (' + res.status + ') ❌');
-            }
-        } catch (err) {
-            setSyncStatus('Download failed ❌');
+    function bindSync() {
+        const ti = document.getElementById('gs-token');
+        if (ti) {
+            ti.value = driveToken || '';
+            ti.onchange = (e) => { driveToken = e.target.value.trim(); gmSet(KEY.token, driveToken); syncStatus('Token saved.'); };
         }
+        const auth = document.getElementById('gs-auth');
+        if (auth) auth.onclick = () => window.open(loginUrl(), '_blank', 'width=520,height=640');
+        const up = document.getElementById('gs-up');
+        if (up) up.onclick = backup;
+        const down = document.getElementById('gs-down');
+        if (down) down.onclick = restore;
+        if (CLIENT_ID.startsWith('YOUR_')) syncStatus('Set CLIENT_ID at the bottom of the script to enable OAuth.');
     }
 
-    function bindSyncControls() {
-        const tokenInput = document.getElementById('snp-drive-token-input');
-        if (tokenInput) {
-            tokenInput.value = driveToken || '';
-            tokenInput.onchange = (e) => {
-                driveToken = e.target.value.trim();
-                GM_setValue(KEY_TOKEN, driveToken);
-                setSyncStatus('Token saved.');
-            };
-        }
-        const authBtn = document.getElementById('snp-auth-btn');
-        if (authBtn) authBtn.onclick = () => {
-            window.open(getLoginUrl(), '_blank', 'width=500,height=600');
-            setSyncStatus('Log in, copy the token from the popup URL bar, paste it above.');
-        };
-        const up = document.getElementById('snp-sync-up');
-        if (up) up.onclick = syncToDrive;
-        const down = document.getElementById('snp-sync-down');
-        if (down) down.onclick = syncFromDrive;
-    }
-
-    // =========================================================================
-    // 11. BOOTSTRAP — every step isolated so one failure can't kill the rest
-    // =========================================================================
     const initErrors = [];
     function safe(fn, label) {
-        try { fn(); }
-        catch (err) {
-            initErrors.push(label + ': ' + ((err && err.message) || err));
-            console.error('[GreaseSniff] init step failed —', label, err);
+        try { fn(); } catch (e) {
+            initErrors.push(label + ': ' + ((e && e.message) || e));
+            console.error('[GreaseySniffs] init step failed -', label, e);
         }
     }
 
-    function startFilterObserver() {
-        new MutationObserver(scheduleFilter).observe(document.body, { childList: true, subtree: true });
+    function startObserver() {
+        const mo = new MutationObserver(recs => {
+            if (applying) return;
+            mutations += recs.length;
+            scheduleFilter();
+        });
+        mo.observe(document.body, { childList: true, subtree: true });
     }
 
     function persistChats() {
-        if (chatDirty) {
-            chatDirty = false;
-            GM_setValue(KEY_CHATS, Object.fromEntries(chatHistory));
-        }
+        if (chatDirty) { chatDirty = false; gmSet(KEY.chats, Object.fromEntries(chatHistory)); }
     }
 
     function init() {
-        console.log('[GreaseSniff] init starting (DOM ready).');
         safe(injectStyles, 'styles');
-        safe(injectDashboard, 'dashboard');
-        safe(observeProfileModals, 'profile-modal observer');
-        safe(startFilterObserver, 'filter observer');
-        safe(() => {
-            setInterval(() => {
-                try { applyFilters(); maintainUI(); updateLiveStats(); }
-                catch (err) { console.error('[GreaseSniff] tick error:', err); }
-            }, 2000);
-        }, 'main interval');
-        safe(() => {
-            setInterval(() => {
-                try { trimMap(profileCache, 5000); trimMap(chatHistory, 5000); persistChats(); }
-                catch (err) { console.error('[GreaseSniff] persistence error:', err); }
-            }, 30000);
-        }, 'persistence interval');
+        safe(injectUI, 'ui');
+        safe(startObserver, 'observer');
+        safe(() => setInterval(() => {
+            try { scheduleFilter(); updateStats(); } catch (e) { console.error(e); }
+        }, 2000), 'tick');
+        safe(() => setInterval(() => {
+            try { trimMap(profileCache, 8000); trimMap(chatHistory, 8000); persistChats(); } catch (e) { console.error(e); }
+        }, 30000), 'persist');
         window.addEventListener('pagehide', persistChats);
-
-        if (initErrors.length) {
-            showFatalBanner('GreaseSniff init problems: ' + initErrors.join(' | '));
-        }
-        console.log('[GreaseSniff] v2.4 loaded. Profiles: ' + profileCache.size + ', chats: ' + chatHistory.size);
+        if (initErrors.length) showBanner('GreaseySniffs init problems: ' + initErrors.join(' | '));
+        log('v' + VERSION + ' ready');
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init, { once: true });
-    } else {
-        init();
-    }
+    installTransports();
 
-    // OAuth token capture
-    if (window.location.hash.includes('access_token=')) {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
+    else init();
+
+    if (window.location.hash.indexOf('access_token=') !== -1) {
         try {
             const params = new URLSearchParams(window.location.hash.substring(1));
-            const token = params.get('access_token');
-            if (token) {
-                driveToken = token;
-                GM_setValue(KEY_TOKEN, token);
+            const tok = params.get('access_token');
+            if (tok) {
+                driveToken = tok;
+                gmSet(KEY.token, tok);
                 history.replaceState(null, '', window.location.pathname + window.location.search);
-                alert('GreaseSniff: Google Drive token captured! You can close the popup tab.');
             }
-        } catch (err) {
-            console.error('[GreaseSniff] token capture failed:', err);
-        }
+        } catch (e) { console.error('[GreaseySniffs] token capture failed', e); }
     }
 
+    pageWin.__GreaseySniffs__ = {
+        version: VERSION,
+        profiles: profileCache,
+        chats: chatHistory,
+        stats: stats,
+        state: () => appState,
+        scan: () => {
+            const ms = document.querySelectorAll(MARKER_SEL);
+            return {
+                markers: ms.length,
+                resolved: Array.prototype.filter.call(ms, m => !!resolveId(m)).length,
+                sample: ms[0] ? ms[0].outerHTML.slice(0, 700) : null,
+                candidates: ms[0] ? candidatesFor(ms[0]) : []
+            };
+        }
+    };
 })();
