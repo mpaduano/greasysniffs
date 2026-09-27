@@ -70,10 +70,13 @@
 
     const profileCache = new Map();
     const chatHistory = new Map();
-    let chatDirty = false;
-    const markerIds = new WeakMap();
-    let lastTarget = null;
-    const stats = { fetch: 0, xhr: 0, ws: 0, users: 0, chats: 0, lastUrl: '' };
+    (function loadChats() {
+        const raw = gmGet(KEY.chats, {}) || {};
+        for (const k of Object.keys(raw)) {
+            const t = Number(raw[k]);
+            if (Number.isFinite(t) && t > 0 && /^[A-Za-z0-9_.:@-]{3,64}$/.test(k)) chatHistory.set(k, t);
+        }
+    })();
 
     function trimMap(map, max) { let n = 0; for (const k of map.keys()) { if (++n > max) map.delete(k); } }
 
@@ -205,8 +208,11 @@
         for (const k in node) { const v = node[k]; if (v && typeof v === 'object') walk(v, depth + 1, budget); }
     }
 
+    const SKIP_URL = /sentry\.io|google-analytics|googletagmanager|hotjar|doubleclick|amplitude|mixpanel|googleapis\.com/i;
+    
     function ingest(text, url, source) {
         if (typeof text !== 'string' || !text || text.length > 4e6) return;
+        const SKIP_URL = /sentry\.io|google-analytics|googletagmanager|hotjar|doubleclick|amplitude|mixpanel|googleapis\.com/i;
         const c = text.charCodeAt(0);
         if (c !== 123 && c !== 91) return;
         let data;
@@ -317,7 +323,12 @@
     function resolveId(el) {
         if (!isEl(el)) return '';
         let rec = markerIds.get(el);
-        if (!rec) { rec = { id: '', candidates: candidatesFor(el) }; markerIds.set(el, rec); }
+        if (!rec) { rec = { id: '', candidates: [], sig: '' }; markerIds.set(el, rec); }
+        if (!rec.candidates.length) {
+            const sig = (typeof el.className === 'string' ? el.className : '') + '|' +
+                el.attributes.length + '|' + (el.firstElementChild ? el.firstElementChild.outerHTML.length : 0);
+            if (sig !== rec.sig) { rec.sig = sig; rec.candidates = candidatesFor(el); }
+        }
         if (rec.candidates.length === 1) return rec.candidates[0];
         if (rec.candidates.length > 1) {
             if (profileCache.size) {
@@ -937,11 +948,11 @@
             try { scheduleFilter(); updateStats(); } catch (e) { console.error(e); }
         }, 2000), 'tick');
         safe(() => setInterval(() => {
-            try { trimMap(profileCache, 8000); trimMap(chatHistory, 8000); persistChats(); } catch (e) { console.error(e); }
-        }, 30000), 'persist');
-        window.addEventListener('pagehide', persistChats);
-        if (initErrors.length) showBanner('GreaseySniffs init problems: ' + initErrors.join(' | '));
-        log('v' + VERSION + ' ready');
+            try {
+                if (!document.getElementById('gs-launcher') || !document.getElementById('gs-dash')) injectUI();
+                scheduleFilter(); updateStats();
+            } catch (e) { console.error(e); }
+        }, 2000), 'tick');
     }
 
     installTransports();
@@ -967,6 +978,29 @@
         chats: chatHistory,
         stats: stats,
         state: () => appState,
+        report: () => {
+            const ms = document.querySelectorAll(MARKER_SEL);
+            let resolved = 0;
+            for (let i = 0; i < ms.length; i++) if (resolveId(ms[i])) resolved++;
+            const roles = new Map();
+            profileCache.forEach(p => { const r = normalizeRole(p.role) || '(none)'; roles.set(r, (roles.get(r) || 0) + 1); });
+            return [
+                'GreaseySniffs v' + VERSION,
+                'transports  fetch=' + stats.fetch + ' xhr=' + stats.xhr + ' ws=' + stats.ws,
+                'users=' + profileCache.size + ' (parsed ' + stats.users + ')  chats=' + chatHistory.size,
+                'markers=' + ms.length + ' resolved=' + resolved,
+                'lastUrl=' + (stats.lastUrl || '(none)'),
+                '',
+                'ROLES SEEN:',
+                ...[...roles.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(e => '  ' + e[0] + ' x' + e[1]),
+                '',
+                'FIRST MARKER HTML:',
+                '  ' + (ms[0] ? ms[0].outerHTML.slice(0, 1200).replace(/\s+/g, ' ') : '(none)'),
+                '',
+                'SAMPLE CACHED USERS:',
+                ...[...profileCache.entries()].slice(0, 5).map(e => '  ' + e[0] + ' => ' + JSON.stringify(e[1]))
+            ].join('\n');
+        },
         scan: () => {
             const ms = document.querySelectorAll(MARKER_SEL);
             return {
