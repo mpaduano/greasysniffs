@@ -15,7 +15,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '2.5.0';
+    const VERSION = '3.0.0';
     const pageWin = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const DEBUG = false;
 
@@ -584,6 +584,7 @@
         if (!d) return;
         d.querySelectorAll('.gs-tab').forEach(t => t.classList.toggle('active', t.dataset.target === target));
         d.querySelectorAll('.gs-panel').forEach(p => { p.style.display = p.id === target ? 'block' : 'none'; });
+        if (document.getElementById('gs-diag')) updateStats();
     }
 
     function bindControls() {
@@ -607,33 +608,41 @@
     function updateStats() {
         const l = document.getElementById('gs-launcher');
         if (l) {
-            const txt = 'GS U' + profileCache.size + ' C' + chatHistory.size;
+            const txt = 'GS v3.0 U' + profileCache.size + ' C' + chatHistory.size;
             if (l.textContent !== txt) l.textContent = txt;
         }
-        const s = document.getElementById('gs-stats');
-        if (!s) return;
         const markers = document.querySelectorAll(MARKER_SEL);
         let resolved = 0;
-        for (let i = 0; i < markers.length; i++) if (resolveId(markers[i])) resolved++;
-        s.innerHTML = 'v' + VERSION + ' | markers <b>' + markers.length + '</b> | resolved <b>' + resolved +
-            '</b> | users <b>' + profileCache.size + '</b> | chatted <b>' + chatHistory.size + '</b><br>' +
-            'payloads fetch:' + stats.fetch + ' xhr:' + stats.xhr + ' ws:' + stats.ws + ' | mutations:' + mutations +
-            (resolved === 0 && markers.length ? '<br><span style="color:#ff7575">No marker ids resolved - see Diagnose tab.</span>' : '');
-
+        try {
+            for (let i = 0; i < markers.length; i++) if (resolveId(markers[i])) resolved++;
+        } catch (e) { resolved = -1; }
+        const s = document.getElementById('gs-stats');
+        if (s) {
+            s.innerHTML = 'v' + VERSION + ' | markers <b>' + markers.length + '</b> | resolved <b>' + resolved +
+                '</b> | users <b>' + profileCache.size + '</b> | chatted <b>' + chatHistory.size + '</b><br>' +
+                'payloads fetch:' + stats.fetch + ' xhr:' + stats.xhr + ' ws:' + stats.ws + ' | mutations:' + mutations +
+                (resolved <= 0 && markers.length ? '<br><span style="color:#ff7575">No marker ids resolved - see Diagnose.</span>' : '');
+        }
         const dg = document.getElementById('gs-diag');
-        if (dg) {
+        if (!dg) return;
+        try {
             const roles = new Map();
             profileCache.forEach(p => { const r = normalizeRole(p.role) || '(none)'; roles.set(r, (roles.get(r) || 0) + 1); });
             const top = [...roles.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(e => e[0] + ' x' + e[1]).join('\n') || '(none yet)';
             const m0 = markers[0];
             dg.textContent =
+                'version   ' + VERSION + '\n' +
                 'Transports  fetch=' + stats.fetch + '  xhr=' + stats.xhr + '  ws=' + stats.ws + '\n' +
                 'Users parsed=' + stats.users + '   chat events=' + stats.chats + '\n' +
+                'markers=' + markers.length + '  resolved=' + resolved + '\n' +
                 'Last payload URL: ' + (stats.lastUrl || '(none)') + '\n\n' +
                 'Roles seen:\n' + top + '\n\n' +
                 'Marker id candidates (first marker):\n' +
                 (m0 ? JSON.stringify(candidatesFor(m0)) : '(no markers on screen)') + '\n\n' +
                 'First marker HTML:\n' + (m0 ? m0.outerHTML.slice(0, 900) : '(none)');
+        } catch (e) {
+            dg.textContent = 'diagnostic threw: ' + ((e && e.message) || e) +
+                '\nversion ' + VERSION + ' | fetch:' + stats.fetch + ' xhr:' + stats.xhr + ' ws:' + stats.ws;
         }
     }
 
